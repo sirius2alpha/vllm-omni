@@ -56,6 +56,215 @@ def test_mxfp8_activation_passes_scale_alg(monkeypatch, mocker: MockerFixture):
     quantize.assert_called_once_with(x, dst_type="fp8", scale_alg=1)
 
 
+def _make_mxfp8_prefix_method(monkeypatch, steps, mode="cpu"):
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8OnlineLinearMethod
+
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", str(steps))
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE", mode)
+    return NPUMxfp8OnlineLinearMethod(DiffusionMXFP8Config())
+
+
+def _set_mxfp8_prefix_context(monkeypatch, step, available=True):
+    import sys
+    from types import SimpleNamespace
+
+    context = SimpleNamespace(denoise_step_idx=step)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_omni.diffusion.forward_context",
+        SimpleNamespace(get_forward_context=lambda: context, is_forward_context_available=lambda: available),
+    )
+
+
+@pytest.mark.parametrize("value, expected", [(None, 0), ("-1", 0), ("0", 0), ("1", 1), ("5", 5)])
+def test_mxfp8_prefix_steps(monkeypatch, value, expected):
+    from vllm_omni.quantization.mxfp8_config import _mxfp8_prefix_bf16_steps
+
+    monkeypatch.delenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", raising=False)
+    if value is not None:
+        monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", value)
+    assert _mxfp8_prefix_bf16_steps() == expected
+
+
+def test_mxfp8_prefix_invalid_steps(monkeypatch):
+    from vllm_omni.quantization.mxfp8_config import _mxfp8_prefix_bf16_steps
+
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", "invalid")
+    with pytest.raises(ValueError):
+        _mxfp8_prefix_bf16_steps()
+
+
+def test_mxfp8_prefix_rejects_unknown_mode_on_save(monkeypatch):
+    from vllm_omni.quantization.mxfp8_config import _mxfp8_save_prefix_master
+
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", "1")
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE", "invalid")
+    with pytest.raises(ValueError, match="Unknown MXFP8 prefix master mode"):
+        _mxfp8_save_prefix_master(Module())
+
+
+def test_mxfp8_prefix_resident_requires_npu(monkeypatch):
+    from vllm_omni.quantization.mxfp8_config import _mxfp8_save_prefix_master
+
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", "1")
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE", "resident")
+    layer = Module()
+    layer.register_parameter("weight", torch.nn.Parameter(torch.ones(4, 64), requires_grad=False))
+    with pytest.raises(RuntimeError, match="loading NPU"):
+        _mxfp8_save_prefix_master(layer)
+
+
+@pytest.mark.parametrize("steps", [0, 1, 5])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mxfp8_prefix_saves_original_weights(monkeypatch, mocker: MockerFixture, steps, dtype):
+    import sys
+    from types import SimpleNamespace
+
+    method = _make_mxfp8_prefix_method(monkeypatch, steps)
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_SCALE_ALG", "1")
+    layer = Module()
+    weight = torch.arange(256, dtype=dtype).reshape(4, 64)
+    expected_master = weight.to(torch.bfloat16).transpose(0, 1).contiguous().clone()
+    layer.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
+
+    def quantize(weight, **kwargs):
+        weight.zero_()
+        return weight, torch.ones(4, 2, dtype=torch.uint8)
+
+    quantize_mock = mocker.Mock(side_effect=quantize)
+    monkeypatch.setitem(
+        sys.modules, "torch_npu", SimpleNamespace(npu_dynamic_mx_quant=quantize_mock, float8_e4m3fn="fp8")
+    )
+    original = layer.weight
+    method.process_weights_after_loading(layer)
+    quantize_mock.assert_called_once_with(original, dst_type="fp8", scale_alg=1)
+    assert layer.weight.shape == (64, 4)
+    assert layer.weight_scale.shape == (1, 4, 2)
+    assert hasattr(layer, "_mxfp8_prefix_master") == bool(steps)
+    if steps:
+        master = layer._mxfp8_prefix_master
+        assert master.dtype == torch.bfloat16
+        assert master.device == torch.device("cpu")
+        assert not master.requires_grad
+        assert master.shape == (64, 4)
+        assert master.is_contiguous()
+        assert torch.equal(master, expected_master)
+        assert layer._mxfp8_prefix_master_mode == "cpu"
+        assert "_mxfp8_prefix_master" not in layer.state_dict()
+    method.process_weights_after_loading(layer)
+    assert quantize_mock.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "steps, step, fallback",
+    [
+        (0, None, False),
+        (1, 0, True),
+        (1, 1, False),
+        (5, -1, False),
+        (5, 0, True),
+        (5, 4, True),
+        (5, 5, False),
+        (50, 49, True),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_mxfp8_prefix_step_boundary(monkeypatch, mocker: MockerFixture, steps, step, fallback, dtype, with_bias):
+    method = _make_mxfp8_prefix_method(monkeypatch, steps)
+    _set_mxfp8_prefix_context(monkeypatch, step)
+    layer = Module()
+    layer._mxfp8_prefix_master = torch.tensor([[1, 3], [2, 4]], dtype=torch.bfloat16)
+    layer._mxfp8_prefix_master_mode = "cpu"
+    x = torch.tensor([[[1, 2], [2, 3]]], dtype=dtype)
+    bias = torch.tensor([1, 2], dtype=torch.float32) if with_bias else None
+    quantize = mocker.patch.object(method, "_quantize_activation", return_value=(x.reshape(-1, 2), None))
+    matmul = mocker.patch.object(method, "_quant_matmul", return_value=torch.zeros(2, 2, dtype=dtype))
+    result = method.apply(layer, x, bias)
+    assert result.shape == x.shape
+    assert result.dtype == dtype
+    if fallback:
+        expected = torch.tensor([[[5, 11], [8, 18]]], dtype=dtype)
+        if with_bias:
+            expected += bias.to(dtype)
+        assert torch.equal(result, expected)
+        quantize.assert_not_called()
+        matmul.assert_not_called()
+    else:
+        quantize.assert_called_once()
+        matmul.assert_called_once()
+        assert torch.count_nonzero(result) == 0
+
+
+@pytest.mark.parametrize("available, step", [(False, 0), (True, None)])
+def test_mxfp8_prefix_without_step_context_uses_mxfp8(monkeypatch, mocker: MockerFixture, available, step):
+    method = _make_mxfp8_prefix_method(monkeypatch, 1)
+    _set_mxfp8_prefix_context(monkeypatch, step, available=available)
+    x = torch.ones(1, 2, dtype=torch.bfloat16)
+    quantize = mocker.patch.object(method, "_quantize_activation", return_value=(x, None))
+    matmul = mocker.patch.object(method, "_quant_matmul", return_value=torch.zeros_like(x))
+    assert torch.equal(method.apply(Module(), x), torch.zeros_like(x))
+    quantize.assert_called_once()
+    matmul.assert_called_once()
+
+
+def test_mxfp8_prefix_requires_saved_master(monkeypatch):
+    method = _make_mxfp8_prefix_method(monkeypatch, 1)
+    _set_mxfp8_prefix_context(monkeypatch, 0)
+    with pytest.raises(RuntimeError, match="without the original master weight"):
+        method.apply(Module(), torch.ones(1, 2, dtype=torch.bfloat16))
+
+
+def test_mxfp8_prefix_resident_device_mismatch(monkeypatch):
+    method = _make_mxfp8_prefix_method(monkeypatch, 1, "resident")
+    _set_mxfp8_prefix_context(monkeypatch, 0)
+    layer = Module()
+    layer._mxfp8_prefix_master = torch.empty(2, 2, device="meta", dtype=torch.bfloat16)
+    layer._mxfp8_prefix_master_mode = "resident"
+    with pytest.raises(RuntimeError, match="device mismatch"):
+        method.apply(layer, torch.ones(1, 2, dtype=torch.bfloat16))
+
+
+def test_mxfp8_prefix_repeated_calls_and_requests(monkeypatch, mocker: MockerFixture):
+    method = _make_mxfp8_prefix_method(monkeypatch, 1, "resident")
+    layer = Module()
+    layer._mxfp8_prefix_master = torch.eye(2, dtype=torch.bfloat16)
+    layer._mxfp8_prefix_master_mode = "resident"
+    x = torch.ones(1, 2, dtype=torch.bfloat16)
+    mocker.patch.object(method, "_quantize_activation", return_value=(x, None))
+    matmul = mocker.patch.object(method, "_quant_matmul", return_value=torch.zeros_like(x))
+    for step in (0, 0, 1, 0, 0):
+        _set_mxfp8_prefix_context(monkeypatch, step)
+        assert torch.equal(method.apply(layer, x), x if step == 0 else torch.zeros_like(x))
+    assert matmul.call_count == 1
+
+
+def test_mxfp8_prefix_steps_follow_environment(monkeypatch, mocker: MockerFixture):
+    method = _make_mxfp8_prefix_method(monkeypatch, 0)
+    layer = Module()
+    x = torch.ones(1, 2, dtype=torch.bfloat16)
+    layer._mxfp8_prefix_master = torch.eye(2, dtype=torch.bfloat16)
+    layer._mxfp8_prefix_master_mode = "cpu"
+    _set_mxfp8_prefix_context(monkeypatch, 0)
+    mocker.patch.object(method, "_quantize_activation", return_value=(x, None))
+    matmul = mocker.patch.object(method, "_quant_matmul", return_value=torch.zeros_like(x))
+    assert torch.equal(method.apply(layer, x), torch.zeros_like(x))
+    monkeypatch.setenv("VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS", "1")
+    assert torch.equal(method.apply(layer, x), x)
+    assert matmul.call_count == 1
+
+
+def test_mxfp8_prefix_fp16_uses_activation_dtype(monkeypatch):
+    method = _make_mxfp8_prefix_method(monkeypatch, 1)
+    _set_mxfp8_prefix_context(monkeypatch, 0)
+    layer = Module()
+    layer._mxfp8_prefix_master = torch.ones(1, 1, dtype=torch.bfloat16)
+    layer._mxfp8_prefix_master_mode = "cpu"
+    x = torch.tensor([[1.001]], dtype=torch.float16)
+    assert torch.equal(method.apply(layer, x), x)
+    assert not torch.equal(x.to(torch.bfloat16).to(torch.float16), x)
+
+
 def test_mxfp8_config_get_name():
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
 

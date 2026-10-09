@@ -217,6 +217,42 @@ export VLLM_OMNI_MXFP8_SCALE_ALG=1
 The installed torch_npu/CANN version must support the selected algorithm and
 the `scale_alg` keyword. Offline checkpoint weights are not requantized.
 
+### NPU Online Prefix BF16 Fallback
+
+Set these variables before model loading to compute the first K denoising
+steps with a saved BF16 weight copy, then resume MXFP8 W8A8 Linear computation:
+
+```bash
+export VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS=5
+export VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE=resident
+```
+
+`VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS` defaults to `0` (disabled); negative values
+are treated as `0`. K refers to zero-based `ForwardContext.denoise_step_idx`
+indices `0 <= step < K`, so multiple CFG passes at the same step all use BF16.
+The step is read from `ForwardContext` for each Linear call. If the pipeline
+does not publish the step, inference continues on the MXFP8 path. Set K above
+zero before loading the model so each online Linear saves its BF16 master.
+
+`VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE` defaults to `cpu`, which transfers the
+saved weight to the activation device on each fallback call. The master is
+stored transposed and contiguous, with shape `(K, N)`. `resident` copies that
+master to its loading NPU and requires activations on that device. Both modes
+retain a full BF16 copy of each local online Linear weight; resident mode can
+significantly increase accelerator memory usage. K larger than the actual
+denoising step count uses BF16 for every denoising step.
+
+The master copy is a plain tensor attribute: it is excluded from `state_dict`
+and is not moved by `module.to()` or managed by layerwise offload. Resident
+fallback is only supported while its loading device remains the activation
+device; model migration, weight reload, sleep/wake, and distributed offload of
+this copy are not supported. Reload the model to change fallback settings or
+weights. The saved weight is BF16; at fallback time it is converted to the
+activation dtype before matmul, and the result is cast back to that dtype. Bias
+is added separately. Attention quantization is unaffected.
+
+### Weight Loading Notes
+
 1. Online mode quantizes BF16 weights at load time using
    `npu_dynamic_mx_quant`. This adds a one-time overhead on the first load
    but requires no checkpoint preparation.

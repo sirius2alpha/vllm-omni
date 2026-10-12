@@ -203,6 +203,8 @@ omni = Omni(model="<autoround-mxfp8-model>")
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
+| `prefix_bf16_steps` | int | `0` | Online NPU only; use the original BF16 weights for denoising indices `0 <= step < K`; `0` disables the fallback |
+| `prefix_bf16_master_mode` | `cpu` or `resident` | `cpu` | Storage location for the retained BF16 weight copy when prefix fallback is enabled |
 
 ## Validation and Notes
 
@@ -219,28 +221,29 @@ the `scale_alg` keyword. Offline checkpoint weights are not requantized.
 
 ### NPU Online Prefix BF16 Fallback
 
-Set these variables before model loading to compute the first K denoising
-steps with a saved BF16 weight copy, then resume MXFP8 W8A8 Linear computation:
+Pass these options in the diffusion quantization config to compute the first K
+denoising steps with a saved BF16 weight copy, then resume MXFP8 W8A8 Linear
+computation:
 
 ```bash
-export VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS=5
-export VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE=resident
+vllm serve <model> --omni \
+  --diffusion-quantization-config '{"method":"mxfp8","prefix_bf16_steps":5,"prefix_bf16_master_mode":"resident"}'
 ```
 
-`VLLM_OMNI_MXFP8_PREFIX_BF16_STEPS` defaults to `0` (disabled); negative values
-are treated as `0`. K refers to zero-based `ForwardContext.denoise_step_idx`
-indices `0 <= step < K`, so multiple CFG passes at the same step all use BF16.
-The step is read from `ForwardContext` for each Linear call. If the pipeline
-does not publish the step, inference continues on the MXFP8 path. Set K above
-zero before loading the model so each online Linear saves its BF16 master.
+`prefix_bf16_steps` defaults to `0` (disabled) and must be non-negative. K
+refers to zero-based `ForwardContext.denoise_step_idx` indices `0 <= step < K`,
+so multiple CFG passes at the same step all use BF16. The step is read from
+`ForwardContext` for each Linear call. If the pipeline does not publish the
+step, inference continues on the MXFP8 path. A positive K is accepted only for
+online MXFP8 weights; pre-quantized checkpoints do not contain the BF16 master.
 
-`VLLM_OMNI_MXFP8_PREFIX_MASTER_MODE` defaults to `cpu`, which transfers the
-saved weight to the activation device on each fallback call. The master is
-stored transposed and contiguous, with shape `(K, N)`. `resident` copies that
-master to its loading NPU and requires activations on that device. Both modes
-retain a full BF16 copy of each local online Linear weight; resident mode can
-significantly increase accelerator memory usage. K larger than the actual
-denoising step count uses BF16 for every denoising step.
+`prefix_bf16_master_mode` defaults to `cpu`, which transfers the saved weight
+to the activation device on each fallback call. The master is stored
+transposed and contiguous, with shape `(in_features, out_features)`.
+`resident` copies that master to its loading NPU and requires activations on
+that device. Both modes retain a full BF16 copy of each local online Linear
+weight; resident mode can significantly increase accelerator memory usage. K
+larger than the actual denoising step count uses BF16 for every denoising step.
 
 The master copy is a plain tensor attribute: it is excluded from `state_dict`
 and is not moved by `module.to()` or managed by layerwise offload. Resident

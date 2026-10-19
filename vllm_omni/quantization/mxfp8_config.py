@@ -90,7 +90,10 @@ def _mx_scale_alg() -> int:
 
 
 def _mxfp8_use_bf16_prefix(steps: int) -> bool:
-    from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+    from vllm_omni.diffusion.forward_context import (
+        get_forward_context,
+        is_forward_context_available,
+    )
 
     if not steps or not is_forward_context_available():
         return False
@@ -108,8 +111,8 @@ def _mxfp8_save_prefix_master(layer, quant_config: DiffusionMXFP8Config) -> None
         if layer.weight.device.type != "npu":
             raise RuntimeError("Resident BF16 master must be prepared on the loading NPU")
         master = master.to(device=layer.weight.device)
-    # Deliberately NOT a Parameter/buffer: DLO must not shard, empty or repoint it.
-    # Owned by the layer and released with the model; model migration is unsupported.
+    # Not a Parameter/buffer: ordinary module moves cannot make it resident.
+    # Only the opt-in DLO provider below hands its storage to the offloader.
     layer._mxfp8_prefix_master = master
     layer._mxfp8_prefix_master_mode = mode
 
@@ -136,7 +139,7 @@ class DiffusionMXFP8Config(QuantizationConfig):
             raise TypeError("prefix_bf16_steps must be an integer")
         if prefix_bf16_steps < 0:
             raise ValueError("prefix_bf16_steps must be non-negative")
-        if prefix_bf16_master_mode not in ("cpu", "resident"):
+        if prefix_bf16_master_mode not in ("cpu", "resident", "dlo"):
             raise ValueError(f"Unknown MXFP8 prefix master mode: {prefix_bf16_master_mode}")
         if is_checkpoint_mxfp8_serialized and prefix_bf16_steps:
             raise ValueError("BF16 prefix fallback requires online MXFP8 weights, not a serialized checkpoint")
@@ -531,6 +534,20 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
       apply / ops      : NPUMxfp8LinearMethod / MXFPLinearMethodBase  (shared)
     """
 
+    def get_layerwise_prefix_weights(self, layer):
+        """Expose exact prefix weights to the opt-in distributed offloader.
+
+        Plain CPU tensors avoid accidental residency through module.to().
+        Small modules outside streaming rings keep the CPU fallback path.
+        """
+        if not self.quant_config.prefix_bf16_steps or self.quant_config.prefix_bf16_master_mode != "dlo":
+            return None
+        return (
+            self.quant_config.prefix_bf16_steps,
+            {"_mxfp8_prefix_master": layer._mxfp8_prefix_master},
+            ("weight", "weight_scale"),
+        )
+
     def _apply_inner(
         self,
         layer: torch.nn.Module,
@@ -544,6 +561,10 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
                 raise RuntimeError("BF16 prefix requested without the original master weight")
             if layer._mxfp8_prefix_master_mode == "resident" and master.device != x.device:
                 raise RuntimeError("Resident master and activation device mismatch")
+            if getattr(layer, "_layerwise_prefix_managed", False) and (
+                master.device != x.device or master.numel() == 0
+            ):
+                raise RuntimeError("DLO BF16 prefix master was not prefetched for this block")
             # Resident mode: .to returns the same tensor (no allocation or H2D).
             # CPU mode is retained only as a numeric/performance control.
             w = master.to(device=x.device, dtype=x.dtype)

@@ -204,7 +204,7 @@ omni = Omni(model="<autoround-mxfp8-model>")
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
 | `prefix_bf16_steps` | int | `0` | Online NPU only; use the original BF16 weights for denoising indices `0 <= step < K`; `0` disables the fallback |
-| `prefix_bf16_master_mode` | `cpu` or `resident` | `cpu` | Storage location for the retained BF16 weight copy when prefix fallback is enabled |
+| `prefix_bf16_master_mode` | `cpu`, `resident`, or `dlo` | `cpu` | Storage policy for the retained BF16 weight copy when prefix fallback is enabled |
 
 ## Validation and Notes
 
@@ -246,13 +246,45 @@ weight; resident mode can significantly increase accelerator memory usage. K
 larger than the actual denoising step count uses BF16 for every denoising step.
 
 The master copy is a plain tensor attribute: it is excluded from `state_dict`
-and is not moved by `module.to()` or managed by layerwise offload. Resident
+and is not moved by `module.to()`. In `cpu` and `resident` modes it is not
+managed by layerwise offload. Resident
 fallback is only supported while its loading device remains the activation
 device; model migration, weight reload, sleep/wake, and distributed offload of
 this copy are not supported. Reload the model to change fallback settings or
 weights. The saved weight is BF16; at fallback time it is converted to the
 activation dtype before matmul, and the result is cast back to that dtype. Bias
 is added separately. Attention quantization is unaffected.
+
+#### Experimental DLO prefix storage
+
+Use `prefix_bf16_master_mode="dlo"` with distributed layerwise offload to
+stream original BF16 masters for `0 <= step < K` and quantized weights/scales
+afterwards. The offloader retains separate CPU backing for both representations
+and uses its existing two device slots, sized to the maximum per-dtype block
+requirement across both layouts. This first implementation does not alias
+allocations across different dtypes; its device storage is bounded by block
+size rather than total model size. Common parameters such as bias and norms
+are included in both host layouts. No runtime requantization is performed.
+
+The prefix provider is explicitly opt-in. Existing `cpu`, `resident`, and K=0
+paths are unchanged. Phase checks invalidate speculative tail-to-head prefetch
+at K and at the start of another request. CPU offload copies do not modify the
+retained original BF16 bits, shape, or stride. Disable restores both formats.
+
+Use pinned host memory and NUMA placement appropriate for the selected devices
+to overlap transfers with compute. BF16-prefix shards use ordinary CPU backing;
+when pinning is enabled, two pinned host staging slots are shared across all
+prefix hook groups and sized to the largest local shard per dtype. Before
+reusing a slot, the offloader waits for its previous transfer to complete.
+This bounds the extra pinned-memory requirement independently of model depth,
+but adds a CPU-to-CPU copy during prefix steps. Quantized backing retains its
+existing pinning policy. HBM savings do not guarantee unchanged
+latency: the prefix now transfers BF16 blocks that were previously resident.
+Small modules outside DLO streaming rings use the existing CPU-copy fallback;
+this also applies if no distributed offloader is installed. This prototype
+does not support prefix storage combined with rank-local mmap/HWR. It requires
+sequential, consistent step context across the participating workers; mixed
+step batches, model migration, weight reload, and sleep/wake are not validated.
 
 ### Weight Loading Notes
 

@@ -365,9 +365,11 @@ class MXFPLinearMethodBase(LinearMethodBase, ABC):
 class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
     """NPU W8A8 MXFP8 offline linear method for pre-quantized checkpoints.
 
-    Weight canonical layout after process_weights_after_loading:
-      weight      : (K, N)              float8_e4m3fn   – pre-transposed for GEMM
-      weight_scale: (K_groups/2, N, 2)  float8_e8m0fnu  – reshaped + pre-transposed
+    Weight storage layout after process_weights_after_loading (kept contiguous
+    for serialization/offload; _quant_matmul creates the transposed views the
+    NPU operator requires):
+      weight      : (N, K)              float8_e4m3fn
+      weight_scale: (N, K_groups/2, 2)  float8_e8m0fnu
 
     NPUMxfp8OnlineLinearMethod normalises to the same layout so apply() is shared.
     """
@@ -465,11 +467,15 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
                 f"MXFP8 mul_scale has {smooth.numel()} values, expected {expected_input} for the local input partition"
             )
 
-        # Weight: BF16 → float8_e4m3fn via npu_dtype_cast, then transpose (N,K) → (K,N).
+        # Weight: BF16 → float8_e4m3fn via npu_dtype_cast.  Keep the physical
+        # (N, K) checkpoint layout contiguous: on real hardware npu_quant_matmul
+        # rejects contiguous transposed copies and requires the transposed-view
+        # storage flag on both x2 and its scale, so the (K, N) view is created
+        # at call time in _quant_matmul (verified on Ascend950PR, PR9103 validation).
         w = layer.weight
         if w.dtype != torch_npu.float8_e4m3fn:
             w = torch_npu.npu_dtype_cast(w.npu(), torch_npu.float8_e4m3fn)
-        w = w.transpose(0, 1).contiguous()
+        w = w.contiguous()
 
         # Scale: checkpoint stores uint8 bytes that ARE float8_e8m0fnu bits.
         # Only convert if neither uint8 nor the target NPU dtype already.
@@ -481,7 +487,7 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
         if K_groups % 2 == 1:
             s = torch.cat([s, torch.zeros(N, 1, dtype=s.dtype, device=s.device)], dim=1)
             K_groups += 1
-        s = s.reshape(N, K_groups // 2, 2).transpose(0, 1).contiguous()
+        s = s.reshape(N, K_groups // 2, 2).contiguous()
 
         replace_parameter(layer, "weight", w)
         replace_parameter(layer, "weight_scale", s)
@@ -520,10 +526,12 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
         # NPU npu_quant_matmul requires bias in float32.
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
+        # npu_quant_matmul requires x2 and scale to carry the transposed-view
+        # storage flag; contiguous copies of the same logical layout are rejected.
         return torch_npu.npu_quant_matmul(
             x_q,
-            layer.weight,  # (K, N) float8_e4m3fn
-            layer.weight_scale,  # (S/2, N, 2) float8_e8m0fnu
+            layer.weight.transpose(0, 1),  # (N, K) storage -> (K, N) transposed view
+            layer.weight_scale.transpose(0, 1),  # (N, S/2, 2) storage -> (S/2, N, 2) transposed view
             scale_dtype=torch_npu.float8_e8m0fnu,
             pertoken_scale=x_scale,
             pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
@@ -570,9 +578,11 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
         # NPU: quantize BF16/FP16 (N, K) → FP8 (N, K) + MX scale (N, S).
         weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight, dst_type=torch_npu.float8_e4m3fn)
 
-        # Normalize to canonical layout shared with offline path.
-        weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).transpose(0, 1).contiguous()
-        weight_fp8 = weight_fp8.transpose(0, 1).contiguous()
+        # Normalize to the offline path's storage contract: contiguous
+        # (N, K) weight and (N, S/2, 2) scale; _quant_matmul builds the
+        # transposed views the NPU operator requires.
+        weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).contiguous()
+        weight_fp8 = weight_fp8.contiguous()
 
         replace_parameter(layer, "weight", weight_fp8)
         replace_parameter(layer, "weight_scale", weight_scale)

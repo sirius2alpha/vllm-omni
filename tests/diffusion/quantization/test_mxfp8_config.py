@@ -311,8 +311,11 @@ def test_apply_reshape_with_bias():
 # process_weights_after_loading shape arithmetic (pure torch, no NPU ops)
 #
 # These tests replicate the CPU-safe portions of process_weights_after_loading
-# to guard the key layout contract: (N,K) weight → (K,N) and (N,S) scale →
-# (S/2,N,2). They do NOT call NPU ops; they test only the math.
+# to guard the storage layout contract: weight stays (N, K) contiguous and the
+# scale is stored as (N, S/2, 2) contiguous. npu_quant_matmul requires the
+# transposed-view storage flag on both operands, which contiguous() copies lose,
+# so the (K, N) / (S/2, N, 2) transposed views are built at call time in
+# _quant_matmul. These tests do NOT call NPU ops; they test only the math.
 # ---------------------------------------------------------------------------
 
 
@@ -322,11 +325,14 @@ def test_apply_reshape_with_bias():
     ids=["64x128", "32x64", "16x96"],
 )
 def test_weight_transpose_contract(n: int, k: int):
-    """Weight must be transposed from (N, K) to (K, N) and be contiguous."""
+    """Weight storage stays (N, K) contiguous; the GEMM view is a call-time transpose."""
     w = torch.zeros(n, k, dtype=torch.uint8)
-    w = w.transpose(0, 1).contiguous()
-    assert w.shape == (k, n)
+    w = w.contiguous()
+    assert w.shape == (n, k)
     assert w.is_contiguous()
+    view = w.transpose(0, 1)
+    assert view.shape == (k, n)
+    assert not view.is_contiguous()
 
 
 @pytest.mark.parametrize(
@@ -339,7 +345,7 @@ def test_weight_transpose_contract(n: int, k: int):
     ids=["even", "odd-to-4", "odd-to-2"],
 )
 def test_weight_scale_reshape_contract(n: int, k_groups: int, expected_groups: int):
-    """Scale must be reshaped from (N, K_groups) to (K_groups_even//2, N, 2).
+    """Scale storage is (N, K_groups_even//2, 2); the (K_groups//2, N, 2) view is call-time.
 
     Odd K_groups must be padded to even before the reshape.
     """
@@ -347,9 +353,12 @@ def test_weight_scale_reshape_contract(n: int, k_groups: int, expected_groups: i
     if k_groups % 2 == 1:
         s = torch.cat([s, torch.zeros(n, 1, dtype=s.dtype)], dim=1)
         k_groups += 1
-    s = s.reshape(n, k_groups // 2, 2).transpose(0, 1).contiguous()
-    assert s.shape == (expected_groups, n, 2)
+    s = s.reshape(n, k_groups // 2, 2).contiguous()
+    assert s.shape == (n, expected_groups, 2)
     assert s.is_contiguous()
+    view = s.transpose(0, 1)
+    assert view.shape == (expected_groups, n, 2)
+    assert not view.is_contiguous()
 
 
 def test_offline_mxfp8_registers_and_loads_smooth_multiplier():

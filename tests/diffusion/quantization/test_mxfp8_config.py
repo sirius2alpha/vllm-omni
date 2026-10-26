@@ -358,10 +358,21 @@ def test_weight_scale_reshape_contract(n: int, k_groups: int, expected_groups: i
     assert s.is_contiguous()
     view = s.transpose(0, 1)
     assert view.shape == (expected_groups, n, 2)
-    assert not view.is_contiguous()
+    if expected_groups > 1:
+        # With a single group the strides happen to be contiguous anyway.
+        assert not view.is_contiguous()
 
 
-def test_offline_mxfp8_registers_and_loads_smooth_multiplier():
+def _stub_tp_group(mocker: MockerFixture) -> None:
+    """ModelWeightParameter eagerly resolves the TP rank at construction;
+    these tests never initialize torch.distributed."""
+    mock_group = mocker.Mock()
+    mock_group.rank_in_group = 0
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+
+def test_offline_mxfp8_registers_and_loads_smooth_multiplier(mocker: MockerFixture):
+    _stub_tp_group(mocker)
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
@@ -390,7 +401,8 @@ def test_offline_mxfp8_registers_and_loads_smooth_multiplier():
     torch.testing.assert_close(layer.mul_scale, loaded_scale)
 
 
-def test_offline_mxfp8_requires_calibration_when_configured():
+def test_offline_mxfp8_requires_calibration_when_configured(mocker: MockerFixture):
+    _stub_tp_group(mocker)
     from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
     from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod

@@ -280,5 +280,15 @@ with RowParallelLinear input channels while replicated by ColumnParallelLinear.
 vector. The merge tool also unwraps msModelSlim's `layer.linear.weight*` names
 when the matching `layer.div.mul_scale` marker is present. A merged checkpoint
 that contains a multiplier for every MXFP8 linear sets
-`require_smooth_scale=true`, making missing metadata a load error. Model-wide
-calibration, weight smoothing, and checkpoint export remain with msModelSlim.
+`require_smooth_scale=true`, making missing metadata a load error. Generic
+calibration support is described in the following section.
+
+## Generic MXFP8 Flex Smooth calibration
+
+`calibrate_mxfp8_flex_smooth` captures inputs to selected Linear-like modules
+and delegates alpha/beta search to MindIE-SD. Its safetensors artifact contains
+only selected-layer MXFP8 tensors. The artifact metadata carries the offline
+`quantization_config` and `ignored_layers` needed to keep all other linears in
+their base dtype; `merge_mxfp8_flex_smooth_state_dict` overlays those tensors
+onto a base checkpoint after validating names and shapes. The calibration
+RMSE is a layer-level simulation score, not a model-quality claim.

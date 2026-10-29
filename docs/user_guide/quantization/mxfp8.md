@@ -224,9 +224,47 @@ runtime names `layer.mul_scale` and `layer.weight*`, then marks scales required
 only when all MXFP8 weights have a corresponding scale. Older
 checkpoints without scales continue to use an identity multiplier.
 
-Model-wide calibration data loading, module-hook management, weight smoothing,
-checkpoint requantization, and export remain msModelSlim responsibilities.
-NPU accuracy and performance still require validation with the target model.
+#### Generic calibration API
+
+vLLM-Omni provides a model-independent calibration helper for PyTorch modules.
+MindIE-SD supplies the MXFP8 Flex Smooth alpha/beta search and quantization
+simulation; the Omni helper captures Linear inputs, creates a tensor patch,
+and provides a merge helper for applying it to a base state dict:
+
+```python
+from vllm_omni.quantization.tools.mxfp8_flex_smooth import (
+    calibrate_mxfp8_flex_smooth,
+    merge_mxfp8_flex_smooth_state_dict,
+)
+
+artifact = calibrate_mxfp8_flex_smooth(
+    model,
+    calibration_batches,
+    output_path="mxfp8_flex_smooth.safetensors",
+    include=("*",),
+    exclude=(),
+)
+merged_state_dict = merge_mxfp8_flex_smooth_state_dict(model.state_dict(), artifact)
+quantization_config = artifact.metadata["quantization_config"]
+```
+
+Pass tensor, positional-tuple, or keyword-mapping batches for ordinary
+`nn.Module` models. Supply `forward_batch(model, batch)` for custom inference
+inputs. `include` and `exclude` match module names with shell-style patterns;
+Linear layers whose input size is not divisible by 32 remain in the base dtype.
+Use `module_name_mapper` when calibration-module names differ from checkpoint
+and runtime layer names. `alpha_candidates`, `beta_candidates`, and
+`search_step` control the MindIE-SD search grid.
+
+The saved safetensors file contains only selected-layer tensors. The merged
+state dict preserves all other base tensors, and `artifact.metadata`
+specifically provides `quantization_config`, `quantized_layers`, and
+`ignored_layers`. Save the merged state dict as the component checkpoint and
+copy `quantization_config` to that component's `config.json`; this selects the
+existing offline MXFP8 runtime path and keeps unselected Linear layers in BF16.
+`normalized_rmse` is a calibration-time linear simulation score, not a model
+quality metric. Target-model quality and performance A/B validation on NPU are
+still required before claiming an accuracy gain.
 
 ## Validation and Notes
 

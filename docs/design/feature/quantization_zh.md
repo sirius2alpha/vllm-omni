@@ -253,3 +253,11 @@ alpha/beta。生成的 safetensors artifact 只包含选中层的 MXFP8 张量�
 提供离线 `quantization_config` 和 `ignored_layers`，让其余线性层保持基础 checkpoint
 精度；`merge_mxfp8_flex_smooth_state_dict` 会在校验名称和形状后，将这些张量覆盖到基础
 state dict。校准 RMSE 是层级量化仿真分数，不代表模型质量结论。
+
+## 通用 MXFP8 DAOS 校准
+
+`calibrate_mxfp8_daos` 使用相同的模型级输入采集和 checkpoint 格式，并将每个选中层委托给
+MindIE-SD 的 `search_mxfp8_daos` 接口。MindIE-SD 依次执行 OASQ 通道平滑与可训练的 MXFP8
+per-block 量化；Omni 导出生成的 `weight`、`weight_scale` 和 `mul_scale` 张量，并在合并到基础
+state dict 时校验。训练指标只描述校准线性层；端到端质量结论须在目标 NPU 上对比纯 MXFP8
+和 BF16。

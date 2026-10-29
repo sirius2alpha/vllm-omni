@@ -292,3 +292,13 @@ only selected-layer MXFP8 tensors. The artifact metadata carries the offline
 their base dtype; `merge_mxfp8_flex_smooth_state_dict` overlays those tensors
 onto a base checkpoint after validating names and shapes. The calibration
 RMSE is a layer-level simulation score, not a model-quality claim.
+
+## Generic MXFP8 DAOS calibration
+
+`calibrate_mxfp8_daos` uses the same model-level capture and checkpoint format,
+and delegates each selected layer to MindIE-SD's `search_mxfp8_daos` API. The
+MindIE-SD search applies OASQ channel smoothing followed by trainable MXFP8
+per-block quantization; Omni writes the resulting `weight`, `weight_scale`, and
+`mul_scale` tensors and validates them when merging into a base state dict.
+Training metrics describe the calibrated linear layer only. End-to-end quality
+claims require target-model NPU comparison against pure MXFP8 and BF16.

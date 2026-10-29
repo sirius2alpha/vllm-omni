@@ -266,6 +266,40 @@ existing offline MXFP8 runtime path and keeps unselected Linear layers in BF16.
 quality metric. Target-model quality and performance A/B validation on NPU are
 still required before claiming an accuracy gain.
 
+#### DAOS calibration API
+
+MindIE-SD also exposes a DAOS search for MXFP8. Omni captures the selected
+Linear inputs, calls MindIE-SD's OASQ-to-TLQ layer search, and exports the
+result in the same offline MXFP8 checkpoint convention:
+
+```python
+from vllm_omni.quantization.tools.mxfp8_daos import (
+    calibrate_mxfp8_daos,
+    merge_mxfp8_daos_state_dict,
+)
+
+artifact = calibrate_mxfp8_daos(
+    model,
+    calibration_batches,
+    output_path="mxfp8_daos.safetensors",
+    include=("*",),
+    exclude=(),
+    train_iters=100,
+)
+merged_state_dict = merge_mxfp8_daos_state_dict(model.state_dict(), artifact)
+quantization_config = artifact.metadata["quantization_config"]
+```
+
+`calibrate_mxfp8_daos` uses each module's current device for the layer search by
+default. `train_iters`, `learning_rate`, and OASQ outlier-search settings are
+passed to MindIE-SD; increasing the training iterations increases calibration
+time and memory use. The artifact contains selected-layer `weight`,
+`weight_scale`, and `mul_scale` tensors and the offline `quantization_config`.
+Copy that config to the model component's `config.json` when saving the merged
+checkpoint. DAOS training metrics describe the calibrated linear layer only.
+They do not establish end-to-end generation quality; compare the same model
+and calibration set against pure MXFP8 and BF16 on the target NPU.
+
 ## Validation and Notes
 
 1. Online mode quantizes BF16 weights at load time using

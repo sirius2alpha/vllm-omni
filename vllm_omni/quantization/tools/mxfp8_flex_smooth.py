@@ -18,34 +18,23 @@ from torch import nn
 
 
 @dataclass(frozen=True)
-class MXFP8FlexSmoothArtifact:
+class MXFP8CalibrationArtifact:
     state_dict: dict[str, torch.Tensor]
     metadata: dict[str, object]
     output_path: Path | None
+
+
+MXFP8FlexSmoothArtifact = MXFP8CalibrationArtifact
 
 
 class _SearchResult(Protocol):
     weight: torch.Tensor
     weight_scale: torch.Tensor
     mul_scale: torch.Tensor
-    alpha: float
-    beta: float
     normalized_rmse: float
 
 
-class _Searcher(Protocol):
-    def __call__(
-        self,
-        weight: torch.Tensor,
-        activations: torch.Tensor,
-        *,
-        bias: torch.Tensor | None,
-        alpha_candidates: Sequence[float] | None,
-        beta_candidates: Sequence[float] | None,
-        search_step: float,
-        max_calibration_tokens: int,
-        max_output_features: int,
-    ) -> _SearchResult: ...
+_Searcher = Callable[..., _SearchResult]
 
 
 def _matches(name: str, patterns: Sequence[str] | None) -> bool:
@@ -111,27 +100,33 @@ def _linear_input_width(module: nn.Module) -> int | None:
     return width
 
 
-def load_mxfp8_flex_smooth_artifact(path: str | Path) -> MXFP8FlexSmoothArtifact:
-    """Load a calibration artifact previously written by this module."""
+def _load_mxfp8_artifact(path: str | Path, expected_format: str, algorithm_name: str) -> MXFP8CalibrationArtifact:
     artifact_path = Path(path)
     with safe_open(str(artifact_path), framework="pt", device="cpu") as safetensor_file:
         file_metadata = safetensor_file.metadata() or {}
     try:
         metadata = json.loads(file_metadata["calibration"])
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"{artifact_path} is not an MXFP8 Flex Smooth artifact") from exc
+        raise ValueError(f"{artifact_path} is not an MXFP8 {algorithm_name} artifact") from exc
     if not isinstance(metadata, dict):
-        raise ValueError(f"{artifact_path} has invalid MXFP8 Flex Smooth metadata")
-    if metadata.get("format") != "mxfp8_flex_smooth_v1":
-        raise ValueError(f"Unsupported MXFP8 Flex Smooth artifact format: {metadata.get('format')!r}")
-    return MXFP8FlexSmoothArtifact(
+        raise ValueError(f"{artifact_path} has invalid MXFP8 {algorithm_name} metadata")
+    if metadata.get("format") != expected_format:
+        raise ValueError(f"Unsupported MXFP8 {algorithm_name} artifact format: {metadata.get('format')!r}")
+    return MXFP8CalibrationArtifact(
         state_dict=load_file(str(artifact_path), device="cpu"), metadata=metadata, output_path=artifact_path
     )
 
 
-def merge_mxfp8_flex_smooth_state_dict(
+def load_mxfp8_flex_smooth_artifact(path: str | Path) -> MXFP8FlexSmoothArtifact:
+    """Load a Flex Smooth calibration artifact previously written by this module."""
+    return _load_mxfp8_artifact(path, "mxfp8_flex_smooth_v1", "Flex Smooth")
+
+
+def _merge_mxfp8_state_dict(
     base_state_dict: Mapping[str, torch.Tensor],
-    artifact: MXFP8FlexSmoothArtifact | str | Path,
+    artifact: MXFP8CalibrationArtifact | str | Path,
+    *,
+    algorithm_name: str,
 ) -> dict[str, torch.Tensor]:
     """Overlay calibrated MXFP8 tensors on a base checkpoint state dict.
 
@@ -139,7 +134,14 @@ def merge_mxfp8_flex_smooth_state_dict(
     component config. ``ignored_layers`` in that config leaves all unselected
     Linear modules in the base checkpoint dtype.
     """
-    loaded_artifact = load_mxfp8_flex_smooth_artifact(artifact) if isinstance(artifact, (str, Path)) else artifact
+    expected_format = f"mxfp8_{algorithm_name.lower().replace(' ', '_')}_v1"
+    loaded_artifact = (
+        _load_mxfp8_artifact(artifact, expected_format, algorithm_name)
+        if isinstance(artifact, (str, Path))
+        else artifact
+    )
+    if loaded_artifact.metadata.get("format") != expected_format:
+        raise ValueError(f"artifact is not an MXFP8 {algorithm_name} artifact")
     quantized_layers = loaded_artifact.metadata.get("quantized_layers")
     if not isinstance(quantized_layers, list) or not quantized_layers:
         raise ValueError("artifact metadata must contain non-empty quantized_layers")
@@ -189,22 +191,30 @@ def merge_mxfp8_flex_smooth_state_dict(
     return {**base_state_dict, **loaded_artifact.state_dict}
 
 
-def calibrate_mxfp8_flex_smooth(
+def merge_mxfp8_flex_smooth_state_dict(
+    base_state_dict: Mapping[str, torch.Tensor],
+    artifact: MXFP8FlexSmoothArtifact | str | Path,
+) -> dict[str, torch.Tensor]:
+    """Overlay Flex Smooth tensors on a base checkpoint state dict."""
+    return _merge_mxfp8_state_dict(base_state_dict, artifact, algorithm_name="Flex Smooth")
+
+
+def _calibrate_mxfp8(
     model: nn.Module,
     calibration_batches: Iterable[object],
     *,
+    result_format: str,
+    searcher: _Searcher,
+    search_options: Mapping[str, object],
+    search_device: str | torch.device | None,
     output_path: str | Path | None = None,
     include: Sequence[str] | None = None,
     exclude: Sequence[str] | None = None,
     max_calibration_tokens: int = 128,
-    max_output_features: int = 128,
-    search_step: float = 0.1,
-    alpha_candidates: Sequence[float] | None = None,
-    beta_candidates: Sequence[float] | None = None,
-    quantizer: _Searcher | None = None,
+    max_output_features: int | None = 128,
     forward_batch: Callable[[nn.Module, object], object] | None = None,
     module_name_mapper: Callable[[str], str] | None = None,
-) -> MXFP8FlexSmoothArtifact:
+) -> MXFP8CalibrationArtifact:
     """Calibrate selected Linear-like modules and export Omni MXFP8 tensors.
 
     Batches may be tensors, positional tuples, or keyword mappings. Frameworks
@@ -218,7 +228,7 @@ def calibrate_mxfp8_flex_smooth(
     """
     if not isinstance(model, nn.Module):
         raise TypeError("model must be a torch.nn.Module")
-    if max_calibration_tokens <= 0 or max_output_features <= 0:
+    if max_calibration_tokens <= 0 or (max_output_features is not None and max_output_features <= 0):
         raise ValueError("max_calibration_tokens and max_output_features must be positive")
 
     linears: dict[str, tuple[nn.Module, int]] = {}
@@ -238,7 +248,6 @@ def calibrate_mxfp8_flex_smooth(
     captures: dict[str, list[torch.Tensor]] = {name: [] for name in selected}
     captured_tokens = {name: 0 for name in selected}
     handles = []
-    search: _Searcher = quantizer or _default_searcher
     forward = forward_batch or _default_forward
     module_modes = {module: module.training for module in model.modules()}
 
@@ -292,32 +301,38 @@ def calibrate_mxfp8_flex_smooth(
     for name, (module, _) in selected.items():
         activations = torch.cat(captures[name], dim=0)
         bias = getattr(module, "bias", None)
-        result = search(
-            module.weight.detach().to(device="cpu", dtype=torch.float32),
-            activations,
-            bias=None if bias is None else bias.detach().to(device="cpu", dtype=torch.float32),
-            search_step=search_step,
-            alpha_candidates=alpha_candidates,
-            beta_candidates=beta_candidates,
-            max_calibration_tokens=max_calibration_tokens,
-            max_output_features=max_output_features,
+        target_device = module.weight.device if search_device is None else torch.device(search_device)
+        search_options_for_layer = {
+            "max_calibration_tokens": max_calibration_tokens,
+            **search_options,
+        }
+        if max_output_features is not None:
+            search_options_for_layer["max_output_features"] = max_output_features
+        result = searcher(
+            module.weight.detach().to(device=target_device, dtype=torch.float32),
+            activations.to(device=target_device),
+            bias=None if bias is None else bias.detach().to(device=target_device, dtype=torch.float32),
+            **search_options_for_layer,
         )
         target_name = mapped_names[name]
         state_dict[_tensor_key(target_name, "weight")] = result.weight.contiguous().cpu()
         state_dict[_tensor_key(target_name, "weight_scale")] = result.weight_scale.contiguous().cpu()
         state_dict[_tensor_key(target_name, "mul_scale")] = result.mul_scale.contiguous().to(torch.float32).cpu()
-        layer_metadata[name] = {
+        result_metadata = {
             "checkpoint_name": target_name,
-            "alpha": float(result.alpha),
-            "beta": float(result.beta),
             "normalized_rmse": float(result.normalized_rmse),
             "calibration_tokens": int(captured_tokens[name]),
         }
+        for field in ("alpha", "beta", "outlier_ratio", "initial_normalized_rmse", "completed_iters"):
+            if hasattr(result, field):
+                value = getattr(result, field)
+                result_metadata[field] = int(value) if field == "completed_iters" else float(value)
+        layer_metadata[name] = result_metadata
 
     mapped_quantized_layers = [mapped_names[name] for name in selected]
     ignored_layers = [mapped_names[name] for name in linears if name not in selected]
     metadata: dict[str, object] = {
-        "format": "mxfp8_flex_smooth_v1",
+        "format": result_format,
         "quantization_config": {
             "quant_method": "mxfp8",
             "is_checkpoint_mxfp8_serialized": True,
@@ -335,9 +350,47 @@ def calibrate_mxfp8_flex_smooth(
             state_dict,
             str(artifact_path),
             metadata={
-                "format": "mxfp8_flex_smooth_v1",
+                "format": result_format,
                 "quantization_config": json.dumps(metadata["quantization_config"], sort_keys=True),
                 "calibration": json.dumps(metadata, sort_keys=True),
             },
         )
-    return MXFP8FlexSmoothArtifact(state_dict=state_dict, metadata=metadata, output_path=artifact_path)
+    return MXFP8CalibrationArtifact(state_dict=state_dict, metadata=metadata, output_path=artifact_path)
+
+
+def calibrate_mxfp8_flex_smooth(
+    model: nn.Module,
+    calibration_batches: Iterable[object],
+    *,
+    output_path: str | Path | None = None,
+    include: Sequence[str] | None = None,
+    exclude: Sequence[str] | None = None,
+    max_calibration_tokens: int = 128,
+    max_output_features: int = 128,
+    search_step: float = 0.1,
+    alpha_candidates: Sequence[float] | None = None,
+    beta_candidates: Sequence[float] | None = None,
+    quantizer: _Searcher | None = None,
+    forward_batch: Callable[[nn.Module, object], object] | None = None,
+    module_name_mapper: Callable[[str], str] | None = None,
+) -> MXFP8FlexSmoothArtifact:
+    """Calibrate selected Linear-like modules with MindIE-SD Flex Smooth."""
+    return _calibrate_mxfp8(
+        model,
+        calibration_batches,
+        result_format="mxfp8_flex_smooth_v1",
+        searcher=quantizer or _default_searcher,
+        search_options={
+            "search_step": search_step,
+            "alpha_candidates": alpha_candidates,
+            "beta_candidates": beta_candidates,
+        },
+        search_device="cpu",
+        output_path=output_path,
+        include=include,
+        exclude=exclude,
+        max_calibration_tokens=max_calibration_tokens,
+        max_output_features=max_output_features,
+        forward_batch=forward_batch,
+        module_name_mapper=module_name_mapper,
+    )

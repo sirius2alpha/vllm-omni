@@ -14,6 +14,7 @@ from vllm_omni.quantization import build_quant_config
 from vllm_omni.quantization.convrot_config import (
     ConvRotInt4OnlineLinearMethod,
     ConvRotInt8OnlineLinearMethod,
+    NPUConvRotInt8OnlineLinearMethod,
     pack_int4,
     quantize_int4,
     regular_hadamard,
@@ -102,7 +103,8 @@ def test_factory_builds_both_methods():
 
 def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: True)
-    for cls in (ConvRotInt8OnlineLinearMethod, ConvRotInt4OnlineLinearMethod):
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    for cls in (ConvRotInt8OnlineLinearMethod, NPUConvRotInt8OnlineLinearMethod, ConvRotInt4OnlineLinearMethod):
         mocker.patch.object(cls, "__init__", lambda self, quant_config: None)
     layer = mocker.Mock(spec=LinearBase)
     config = build_quant_config(
@@ -123,8 +125,52 @@ def test_layers_route_to_int4_int8_or_unquantized(mocker: MockerFixture, monkeyp
     assert config.get_quant_method(torch.nn.Module(), "norm") is None
     assert isinstance(build_quant_config("convrot_int8").get_quant_method(layer, "x"), ConvRotInt8OnlineLinearMethod)
     monkeypatch.setattr(current_omni_platform, "is_cuda", lambda: False)
-    with pytest.raises(NotImplementedError, match="CUDA"):
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: False)
+    with pytest.raises(NotImplementedError, match="CUDA and Ascend NPU"):
         config.get_quant_method(layer, "blocks.0.ff.net.2")
+
+    monkeypatch.setattr(current_omni_platform, "is_npu", lambda: True)
+    assert isinstance(
+        build_quant_config("convrot_int8").get_quant_method(layer, "blocks.0.ff.net.2"),
+        NPUConvRotInt8OnlineLinearMethod,
+    )
+    with pytest.raises(NotImplementedError, match="INT4.*CUDA"):
+        build_quant_config("convrot_int4").get_quant_method(layer, "blocks.0.ff.net.2")
+
+
+def test_npu_int8_method_rotates_weights_and_activations(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch):
+    from vllm_omni.quantization.int8_config import NPUInt8OnlineLinearMethod
+
+    monkeypatch.setattr(
+        "vllm_omni.quantization.convrot_config._rotate_npu",
+        lambda tensor, group: rotate(tensor, regular_hadamard(group).to(tensor)),
+    )
+    mocker.patch.object(NPUInt8OnlineLinearMethod, "process_weights_after_loading", lambda self, layer: None)
+    mocker.patch.object(
+        NPUInt8OnlineLinearMethod,
+        "apply",
+        lambda self, layer, x, bias=None: torch.nn.functional.linear(x, layer.weight, bias),
+    )
+
+    weight = torch.randn(8, 64)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+    layer.input_size_per_partition = 64
+    layer.orig_dtype = torch.float32
+    method = NPUConvRotInt8OnlineLinearMethod(build_quant_config("convrot_int8"))
+    method.rotation_group_size = 16
+
+    method.process_weights_after_loading(layer)
+    torch.testing.assert_close(layer.weight, rotate(weight, regular_hadamard(16)))
+    assert layer.convrot_hadamard is None and layer.convrot_group_size == 16
+
+    x = torch.randn(2, 3, 64)
+    torch.testing.assert_close(
+        method.apply(layer, x),
+        torch.nn.functional.linear(x, weight),
+        rtol=1e-5,
+        atol=1e-5,
+    )
 
 
 @cuda_available

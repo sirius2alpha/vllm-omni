@@ -7,7 +7,7 @@ checkpoint while loading:
 
 | Method | Weights | Activations | GEMM |
 | --- | --- | --- | --- |
-| `convrot_int8` | INT8, per output channel | INT8, dynamic per token | vLLM INT8 kernels |
+| `convrot_int8` | INT8, per output channel | INT8, dynamic per token | vLLM INT8 kernels on CUDA; `npu_quant_matmul` on Ascend |
 | `convrot_int4` | INT4, per output channel, packed two per byte | INT4, dynamic per token | INT8 tensor cores on the INT4 values |
 
 Before quantization, the input dimension of every linear layer is split into
@@ -18,6 +18,8 @@ orthogonal, so the layer output is unchanged, while channel outliers -- which
 DiT activations have in large numbers -- are spread across their group before
 the per-token and per-channel scales are taken. Weights are rotated once at
 load time; activations are rotated with one small reshape-matmul per forward.
+On Ascend, MindIE-SD applies the same rotation as a sequence of small
+Kronecker-factor transforms before the NPU INT8 quantization and GEMM.
 
 `convrot_int4` stores INT4 weights (a quarter of BF16 storage) and computes the
 W4A4 product exactly on INT8 tensor cores, which also run on GPUs without INT4
@@ -31,6 +33,18 @@ sensitive layers.
 vllm serve <model> --omni --quantization convrot_int8
 vllm serve <model> --omni --quantization convrot_int4
 ```
+
+On Ascend, `convrot_int8` is an online path: start from the original BF16/FP16
+checkpoint, not a checkpoint that has already been quantized to INT8. For a
+one-time customer evaluation, compare three runs from that same source:
+unquantized BF16/FP16 (omit `--quantization`), standard online INT8
+(`--quantization int8`), and ConvRot (`--quantization convrot_int8`). Keep the
+prompts, seeds, scheduler, resolution, and inference steps identical. Include
+the customer's existing INT8 output as a separate deployment comparison if its
+export path differs. Record the acceptance threshold, generated outputs,
+quality results, latency, peak memory, model/revision, and Ascend software
+versions. Support in the loader alone does not establish that a particular
+model meets its quality target.
 
 ```python
 from vllm_omni import Omni
@@ -88,8 +102,20 @@ after unpacking; it saves memory but is not faster than `convrot_int8` there.
 
 ## Limitations
 
-- CUDA only (compute capability 8.0+). Weights are quantized online; ConvRot
-  checkpoints are not serialized.
+- `convrot_int8` supports CUDA (compute capability 8.0+) and Ascend NPU;
+  `convrot_int4` is CUDA only. The Ascend path requires a MindIE-SD version
+  that exports `regular_hadamard_transform`.
+- Weights are quantized online from a BF16/FP16 checkpoint. ConvRot does not
+  transform an already-quantized INT8 checkpoint and does not serialize a new
+  ConvRot checkpoint.
+- The Ascend path has not been validated on the customer's model. Compare
+  against BF16 with identical prompts, seeds, scheduler, and inference steps;
+  support in the loader does not establish an accuracy improvement.
+- The model must already be loadable by Omni, and its target projections must
+  use vLLM `LinearBase` layers. ConvRot does not add model-architecture
+  support.
+- Only `convrot_int8` is routed to the Ascend NPU path; `convrot_int4` and its
+  mixed INT8/INT4 configuration remain CUDA-only.
 - Rotation, activation quantization and, for `convrot_int4`, weight unpacking
   run as separate operations around the GEMM; they are not fused.
 - INT4 activations have a coarse per-token resolution. Compare against BF16 on

@@ -130,6 +130,15 @@ Method configuration owns the mode flag, for example
 `is_checkpoint_int8_serialized` or `is_checkpoint_mxfp8_serialized`. The
 configuration's `get_quant_method()` selects the corresponding linear method.
 
+ConvRot INT8 is online-only. It loads BF16/FP16 weights, applies the same
+normalized orthogonal Hadamard transform to each supported linear layer's
+input groups in both the weights and activations, then uses the platform's
+existing dynamic W8A8 method. The paired transforms preserve the floating-point
+linear result while changing the values presented to quantization. Ascend uses
+MindIE-SD's factorized regular-Hadamard transform before the existing NPU INT8
+quantization and GEMM. ConvRot does not convert a serialized INT8 checkpoint;
+the information needed to rotate its original weights is no longer available.
+
 For pipelines with transformer-specific `config.json` files, such as cascade
 models, `resolve_quant_config_from_disk()` reconciles the active configuration
 with each transformer's checkpoint metadata. Its invariants are:

@@ -13,7 +13,8 @@ costs linear rather than quadratic time in the hidden size.
 
 Weights are rotated in FP32 once at load time; activations are rotated on every
 forward. ``convrot_int8`` quantizes both to INT8 (dynamic per-token
-activations, per-output-channel weights) through vLLM's INT8 kernels.
+activations, per-output-channel weights) through vLLM's CUDA INT8 kernels or
+the existing Ascend NPU INT8 linear method.
 ``convrot_int4`` quantizes both to INT4 with the same granularity, keeps the
 weight packed two values per byte, and runs the product on INT8 tensor cores,
 which compute the INT4 values exactly on GPUs without INT4 MMA (e.g. Hopper).
@@ -44,6 +45,7 @@ from vllm_omni.quantization.int8_config import (
     DiffusionInt8Config,
     Int8OnlineLinearMethod,
     LazyWeightMixin,
+    NPUInt8OnlineLinearMethod,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +89,19 @@ def rotate(x: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x.reshape(*x.shape[:-1], x.shape[-1] // size, size), hadamard).reshape(x.shape)
 
 
+@functools.cache
+def _mindiesd_hadamard_transform():
+    try:
+        from mindiesd.quantization import regular_hadamard_transform
+    except ImportError as exc:
+        raise ImportError("Ascend ConvRot INT8 requires MindIE-SD with regular_hadamard_transform support.") from exc
+    return regular_hadamard_transform
+
+
+def _rotate_npu(x: torch.Tensor, group_size: int) -> torch.Tensor:
+    return _mindiesd_hadamard_transform()(x, group_size)
+
+
 def quantize_int4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric per-row INT4 values (held in INT8) and FP32 scales of shape ``[rows, 1]``."""
     x = x.float()
@@ -125,13 +140,18 @@ def _materialized_weight(layer: Module) -> torch.Tensor:
     return layer.weight
 
 
-def _rotated_weight(layer: Module, requested_group: int) -> torch.Tensor:
+def _rotated_weight(layer: Module, requested_group: int, *, npu_fast: bool = False) -> torch.Tensor:
     """The FP32 weight rotated in place of its input groups; registers the activation rotation.
 
     A layer whose input no power-of-four group tiles keeps no rotation.
     """
     weight = _materialized_weight(layer).data.float()
     group = rotation_group_size(layer.input_size_per_partition, requested_group)
+    layer.convrot_group_size = group
+    if npu_fast:
+        layer.register_buffer("convrot_hadamard", None, persistent=False)
+        return weight if group is None else _rotate_npu(weight, group)
+
     hadamard = None if group is None else regular_hadamard(group).to(device=weight.device)
     layer.register_buffer(
         "convrot_hadamard", None if hadamard is None else hadamard.to(layer.orig_dtype), persistent=False
@@ -208,10 +228,14 @@ class DiffusionConvRotConfig(QuantizationConfig):
             return None
         if self._matches(prefix, self.ignored_layers):
             return UnquantizedLinearMethod()
-        if not current_omni_platform.is_cuda():
-            raise NotImplementedError("ConvRot quantization currently runs on CUDA only.")
         if self.weight_bits == 8 or self._matches(prefix, self.int8_layers):
+            if current_omni_platform.is_npu():
+                return NPUConvRotInt8OnlineLinearMethod(self)
+            if not current_omni_platform.is_cuda():
+                raise NotImplementedError("ConvRot INT8 quantization supports CUDA and Ascend NPU only.")
             return ConvRotInt8OnlineLinearMethod(self)
+        if not current_omni_platform.is_cuda():
+            raise NotImplementedError("ConvRot INT4 quantization currently supports CUDA only.")
         return ConvRotInt4OnlineLinearMethod(self)
 
 
@@ -231,8 +255,10 @@ class DiffusionConvRotInt4Config(DiffusionConvRotConfig):
         return "convrot_int4"  # type: ignore[return-value]
 
 
-class ConvRotInt8OnlineLinearMethod(Int8OnlineLinearMethod):
-    """Rotated W8A8: per-output-channel INT8 weights and dynamic per-token INT8 activations."""
+class _ConvRotInt8OnlineLinearMixin:
+    """Shared rotated W8A8 handling for CUDA and Ascend INT8 kernels."""
+
+    uses_npu_rotation = False
 
     def __init__(self, quant_config: DiffusionConvRotConfig):
         super().__init__(quant_config._int8)
@@ -241,13 +267,31 @@ class ConvRotInt8OnlineLinearMethod(Int8OnlineLinearMethod):
     def process_weights_after_loading(self, layer: Module) -> None:
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
-        layer.weight.data = _rotated_weight(layer, self.rotation_group_size).to(layer.orig_dtype)
+        layer.weight.data = _rotated_weight(
+            layer,
+            self.rotation_group_size,
+            npu_fast=self.uses_npu_rotation,
+        ).to(layer.orig_dtype)
         super().process_weights_after_loading(layer)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
-        if layer.convrot_hadamard is not None:
+        if self.uses_npu_rotation:
+            group = getattr(layer, "convrot_group_size", None)
+            if group is not None:
+                x = _rotate_npu(x, group)
+        elif layer.convrot_hadamard is not None:
             x = rotate(x, layer.convrot_hadamard)
         return super().apply(layer, x, bias)
+
+
+class ConvRotInt8OnlineLinearMethod(_ConvRotInt8OnlineLinearMixin, Int8OnlineLinearMethod):
+    """Rotated W8A8 using CUDA's per-token activation INT8 kernel."""
+
+
+class NPUConvRotInt8OnlineLinearMethod(_ConvRotInt8OnlineLinearMixin, NPUInt8OnlineLinearMethod):
+    """Rotated W8A8 using MindIE-SD's factorized transform and Ascend INT8 GEMM."""
+
+    uses_npu_rotation = True
 
 
 class ConvRotInt4OnlineLinearMethod(LazyWeightMixin, BaseInt8LinearMethod):

@@ -103,7 +103,7 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
 
 
 def _build_convrot_int8(**kw: Any) -> QuantizationConfig:
-    """Lazy import for ConvRot rotated W8A8 diffusion config (CUDA only)."""
+    """Lazy import for ConvRot rotated W8A8 diffusion config."""
     from .convrot_config import DiffusionConvRotInt8Config
 
     return DiffusionConvRotInt8Config(**kw)

@@ -1776,7 +1776,7 @@ class MiniMaxH3DiTModel(nn.Module):
                 # parameter, including TP slicing and online quantization.
                 weight_loader(param, loaded_weight, layout)
                 qkv_parts.setdefault(name, set()).add(layout)
-            elif name.endswith(".attn.qkv_proj.weight"):
+            elif name.endswith((".attn.qkv_proj.weight", ".attn.qkv_proj.weight_scale")):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(

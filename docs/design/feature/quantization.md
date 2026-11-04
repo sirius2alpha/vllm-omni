@@ -258,3 +258,37 @@ passing factory tests alone does not establish production support.
 - Method implementations own platform-specific capability checks and kernels.
 - User-facing support claims require model, hardware, numerical, and memory
   validation in addition to configuration-level tests.
+
+## MXFP8 SmoothQuant boundary
+
+The native NPU MXFP8 path supports an optional per-input-channel multiplier
+named `mul_scale`. For a linear layer, the exporter preserves the original
+operator by pairing these transforms:
+
+```text
+x_smoothed = x * mul_scale
+w_smoothed = w / mul_scale[None, :]
+```
+
+The runtime applies the activation-side multiplier before dynamic MXFP8
+activation quantization. The checkpoint must already contain MXFP8 weights
+quantized from `w_smoothed`; runtime code does not dequantize and requantize
+weights. The multiplier follows the input dimension and is therefore sharded
+with RowParallelLinear input channels while replicated by ColumnParallelLinear.
+
+`mul_scale` is optional for backwards compatibility and defaults to an identity
+vector. The merge tool also unwraps msModelSlim's `layer.linear.weight*` names
+when the matching `layer.div.mul_scale` marker is present. A merged checkpoint
+that contains a multiplier for every MXFP8 linear sets
+`require_smooth_scale=true`, making missing metadata a load error. Generic
+calibration support is described in the following section.
+
+## Generic MXFP8 Flex Smooth calibration
+
+`calibrate_mxfp8_flex_smooth` captures inputs to selected Linear-like modules
+and delegates alpha/beta search to msModelSlim's pure tensor API. Its
+safetensors artifact contains only selected-layer MXFP8 tensors. The artifact
+metadata carries the offline `quantization_config` and `ignored_layers` needed
+to keep all other linears in their base dtype; `merge_mxfp8_flex_smooth_state_dict` overlays those tensors
+onto a base checkpoint after validating names and shapes. The calibration
+RMSE is a layer-level simulation score, not a model-quality claim.

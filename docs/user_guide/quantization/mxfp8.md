@@ -10,7 +10,7 @@ FP8 while keeping the same 8-bit weight footprint.
 This method supports three modes:
 
 | Mode | Description |
-|------|-------------|
+| ------ | ------------- |
 | **Online** | BF16 weights are quantized to MXFP8 at load time — no pre-processing needed |
 | **Offline (Native)** | msModelSlim-exported MXFP8 weights converted to diffusers format via `merge_mxfp8_checkpoint.py` — weights and scales are loaded directly from the preprocessed checkpoint |
 | **Offline (AutoRound)** | AutoRound MXFP8 checkpoints with `data_type="mx_fp"` — auto-detected from `config.json` |
@@ -18,7 +18,7 @@ This method supports three modes:
 ## Hardware Support
 
 | Device | Online | Offline (Native) | Offline (AutoRound) |
-|--------|--------|------------------|---------------------|
+| -------- | -------- | ------------------ | --------------------- |
 | NVIDIA Blackwell GPU (SM 100+) | ⭕ | ⭕ | ⭕ |
 | NVIDIA Ada/Hopper GPU (SM 89+) | ⭕ | ⭕ | ⭕ |
 | NVIDIA Ampere GPU (SM 80+) | ⭕ | ⭕ | ⭕ |
@@ -35,7 +35,7 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 ### Diffusion Model (Wan2.2)
 
 | Model | Mode | Notes |
-|-------|------|-------|
+| ------- | ------ | ------- |
 | Wan2.2-T2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
 | Wan2.2-I2V-A14B | Online + Offline | MoE cascade; quantizes two transformers (`transformer` + `transformer_2`) |
 | Wan2.2-TI2V-5B | Online + Offline | Single transformer |
@@ -43,14 +43,14 @@ Legend: `✅` supported, `❌` unsupported, `⭕` not verified in this guide.
 ### Multi-Stage Omni/TTS Model (Qwen3-Omni, Qwen3-TTS)
 
 | Model | Status | Notes |
-|-------|--------|-------|
+| ------- | ------------- | ----- |
 | Qwen3-Omni | Not validated | — |
 | Qwen3-TTS | Not validated | — |
 
 ### Multi-Stage Diffusion Model (BAGEL, GLM-Image)
 
 | Model | Status | Notes |
-|-------|--------|-------|
+| ------- | ------------- | ----- |
 | BAGEL | Not validated | — |
 | GLM-Image | Not validated | — |
 
@@ -132,7 +132,7 @@ python vllm_omni/quantization/tools/merge_mxfp8_checkpoint.py \
 ```
 
 | Argument | Description |
-|----------|-------------|
+| ---------- | ------------- |
 | `--model-type` | Model variant: `Wan2.2-T2V-A14B`, `Wan2.2-I2V-A14B`, or `Wan2.2-TI2V-5B` |
 | `--original-model` | Root directory of the original BF16 diffusers model |
 | `--quant-path` | Root directory of the msModelSlim quantized output |
@@ -199,10 +199,106 @@ omni = Omni(model="<autoround-mxfp8-model>")
 ## Parameters
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `method` | str | — | Must be `"mxfp8"` |
 | `is_checkpoint_mxfp8_serialized` | bool | `False` | `True` for offline pre-quantized checkpoints; auto-set from `config.json` when using the preprocessing script |
 | `ignored_layers` | list[str] | `[]` | Layer name substrings to keep in BF16 (e.g. `"to_out"` matches `blocks.0.attn1.to_out.0`) |
+| `require_smooth_scale` | bool | `False` | Offline checkpoint only. Set by the merge tool when every MXFP8 linear has a calibrated `mul_scale`; missing scales then fail checkpoint loading. |
+
+### SmoothQuant checkpoint support (NPU)
+
+Offline MXFP8 checkpoints can carry one floating-point `mul_scale` vector per
+linear layer. Before MXFP8 quantization, the exporter must apply the paired
+transform to the original weights and activation:
+
+```text
+x_smoothed = x * mul_scale
+w_smoothed = w / mul_scale[None, :]
+```
+
+The runtime applies `mul_scale` before activation quantization. The weight
+checkpoint must contain the MXFP8 quantization of `w_smoothed`; adding a scale
+to an already quantized weight is not equivalent. For msModelSlim checkpoints,
+the merge tool maps `layer.div.mul_scale` and `layer.linear.weight*` to the
+runtime names `layer.mul_scale` and `layer.weight*`, then marks scales required
+only when all MXFP8 weights have a corresponding scale. Older
+checkpoints without scales continue to use an identity multiplier.
+
+#### Generic calibration API
+
+vLLM-Omni provides a model-independent calibration helper for PyTorch modules.
+MindIE-SD supplies the MXFP8 Flex Smooth alpha/beta search and quantization
+simulation; the Omni helper captures Linear inputs, creates a tensor patch,
+and provides a merge helper for applying it to a base state dict:
+
+```python
+from vllm_omni.quantization.tools.mxfp8_flex_smooth import (
+    calibrate_mxfp8_flex_smooth,
+    merge_mxfp8_flex_smooth_state_dict,
+)
+
+artifact = calibrate_mxfp8_flex_smooth(
+    model,
+    calibration_batches,
+    output_path="mxfp8_flex_smooth.safetensors",
+    include=("*",),
+    exclude=(),
+)
+merged_state_dict = merge_mxfp8_flex_smooth_state_dict(model.state_dict(), artifact)
+quantization_config = artifact.metadata["quantization_config"]
+```
+
+Pass tensor, positional-tuple, or keyword-mapping batches for ordinary
+`nn.Module` models. Supply `forward_batch(model, batch)` for custom inference
+inputs. `include` and `exclude` match module names with shell-style patterns;
+Linear layers whose input size is not divisible by 32 remain in the base dtype.
+Use `module_name_mapper` when calibration-module names differ from checkpoint
+and runtime layer names. `alpha_candidates`, `beta_candidates`, and
+`search_step` control the MindIE-SD search grid.
+
+The saved safetensors file contains only selected-layer tensors. The merged
+state dict preserves all other base tensors, and `artifact.metadata`
+specifically provides `quantization_config`, `quantized_layers`, and
+`ignored_layers`. Save the merged state dict as the component checkpoint and
+copy `quantization_config` to that component's `config.json`; this selects the
+existing offline MXFP8 runtime path and keeps unselected Linear layers in BF16.
+`normalized_rmse` is a calibration-time linear simulation score, not a model
+quality metric. Target-model quality and performance A/B validation on NPU are
+still required before claiming an accuracy gain.
+
+#### DAOS calibration API
+
+ModelSlim exposes the DAOS tensor search for MXFP8. Omni captures the selected
+Linear inputs, calls ModelSlim's OASQ-to-TLQ layer search, and exports the
+result in the same offline MXFP8 checkpoint convention:
+
+```python
+from vllm_omni.quantization.tools.mxfp8_daos import (
+    calibrate_mxfp8_daos,
+    merge_mxfp8_daos_state_dict,
+)
+
+artifact = calibrate_mxfp8_daos(
+    model,
+    calibration_batches,
+    output_path="mxfp8_daos.safetensors",
+    include=("*",),
+    exclude=(),
+    train_iters=100,
+)
+merged_state_dict = merge_mxfp8_daos_state_dict(model.state_dict(), artifact)
+quantization_config = artifact.metadata["quantization_config"]
+```
+
+`calibrate_mxfp8_daos` uses each module's current device for the layer search by
+default. `train_iters`, `learning_rate`, and OASQ outlier-search settings are
+passed to ModelSlim; increasing the training iterations increases calibration
+time and memory use. The artifact contains selected-layer `weight`,
+`weight_scale`, and `mul_scale` tensors and the offline `quantization_config`.
+Copy that config to the model component's `config.json` when saving the merged
+checkpoint. DAOS training metrics describe the calibrated linear layer only.
+They do not establish end-to-end generation quality; compare the same model
+and calibration set against pure MXFP8 and BF16 on the target NPU.
 
 ## Validation and Notes
 

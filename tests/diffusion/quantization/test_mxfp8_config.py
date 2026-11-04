@@ -43,6 +43,7 @@ def test_mxfp8_config_from_config_defaults():
     cfg = DiffusionMXFP8Config.from_config({})
     assert cfg.is_checkpoint_mxfp8_serialized is False
     assert cfg.ignored_layers == []
+    assert cfg.require_smooth_scale is False
 
 
 def test_mxfp8_config_from_config_serialized():
@@ -50,6 +51,27 @@ def test_mxfp8_config_from_config_serialized():
 
     cfg = DiffusionMXFP8Config.from_config({"is_checkpoint_mxfp8_serialized": True})
     assert cfg.is_checkpoint_mxfp8_serialized is True
+
+
+def test_mxfp8_config_from_config_require_smooth_scale():
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    cfg = DiffusionMXFP8Config.from_config({"is_checkpoint_mxfp8_serialized": True, "require_smooth_scale": True})
+    assert cfg.require_smooth_scale is True
+
+
+def test_mxfp8_config_rejects_smooth_scale_for_online_checkpoint():
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    with pytest.raises(ValueError, match="requires an offline MXFP8 checkpoint"):
+        DiffusionMXFP8Config(require_smooth_scale=True)
+
+
+def test_mxfp8_config_rejects_non_boolean_smooth_scale_requirement():
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config
+
+    with pytest.raises(ValueError, match="require_smooth_scale must be a boolean"):
+        DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True, require_smooth_scale="true")
 
 
 def test_mxfp8_config_from_config_ignored_layers():
@@ -289,8 +311,11 @@ def test_apply_reshape_with_bias():
 # process_weights_after_loading shape arithmetic (pure torch, no NPU ops)
 #
 # These tests replicate the CPU-safe portions of process_weights_after_loading
-# to guard the key layout contract: (N,K) weight → (K,N) and (N,S) scale →
-# (S/2,N,2). They do NOT call NPU ops; they test only the math.
+# to guard the storage layout contract: weight stays (N, K) contiguous and the
+# scale is stored as (N, S/2, 2) contiguous. npu_quant_matmul requires the
+# transposed-view storage flag on both operands, which contiguous() copies lose,
+# so the (K, N) / (S/2, N, 2) transposed views are built at call time in
+# _quant_matmul. These tests do NOT call NPU ops; they test only the math.
 # ---------------------------------------------------------------------------
 
 
@@ -300,11 +325,14 @@ def test_apply_reshape_with_bias():
     ids=["64x128", "32x64", "16x96"],
 )
 def test_weight_transpose_contract(n: int, k: int):
-    """Weight must be transposed from (N, K) to (K, N) and be contiguous."""
+    """Weight storage stays (N, K) contiguous; the GEMM view is a call-time transpose."""
     w = torch.zeros(n, k, dtype=torch.uint8)
-    w = w.transpose(0, 1).contiguous()
-    assert w.shape == (k, n)
+    w = w.contiguous()
+    assert w.shape == (n, k)
     assert w.is_contiguous()
+    view = w.transpose(0, 1)
+    assert view.shape == (k, n)
+    assert not view.is_contiguous()
 
 
 @pytest.mark.parametrize(
@@ -317,7 +345,7 @@ def test_weight_transpose_contract(n: int, k: int):
     ids=["even", "odd-to-4", "odd-to-2"],
 )
 def test_weight_scale_reshape_contract(n: int, k_groups: int, expected_groups: int):
-    """Scale must be reshaped from (N, K_groups) to (K_groups_even//2, N, 2).
+    """Scale storage is (N, K_groups_even//2, 2); the (K_groups//2, N, 2) view is call-time.
 
     Odd K_groups must be padded to even before the reshape.
     """
@@ -325,9 +353,187 @@ def test_weight_scale_reshape_contract(n: int, k_groups: int, expected_groups: i
     if k_groups % 2 == 1:
         s = torch.cat([s, torch.zeros(n, 1, dtype=s.dtype)], dim=1)
         k_groups += 1
-    s = s.reshape(n, k_groups // 2, 2).transpose(0, 1).contiguous()
-    assert s.shape == (expected_groups, n, 2)
+    s = s.reshape(n, k_groups // 2, 2).contiguous()
+    assert s.shape == (n, expected_groups, 2)
     assert s.is_contiguous()
+    view = s.transpose(0, 1)
+    assert view.shape == (expected_groups, n, 2)
+    if expected_groups > 1:
+        # With a single group the strides happen to be contiguous anyway.
+        assert not view.is_contiguous()
+
+
+def _stub_tp_group(mocker: MockerFixture) -> None:
+    """ModelWeightParameter eagerly resolves the TP rank at construction;
+    these tests never initialize torch.distributed."""
+    mock_group = mocker.Mock()
+    mock_group.rank_in_group = 0
+    mocker.patch("vllm.distributed.parallel_state.get_tp_group", return_value=mock_group)
+
+
+def test_offline_mxfp8_registers_and_loads_smooth_multiplier(mocker: MockerFixture):
+    _stub_tp_group(mocker)
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    layer = Module()
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True))
+    method.create_weights(
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[8],
+        input_size=64,
+        output_size=8,
+        params_dtype=torch.bfloat16,
+        weight_loader=default_weight_loader,
+    )
+
+    assert layer.mul_scale.shape == (64,)
+    assert layer.mul_scale.dtype == torch.float32
+    assert layer.mul_scale.input_dim == 0
+    assert layer.weight_scale.input_dim == 1
+    assert layer.mul_scale.is_checkpoint_optional
+    torch.testing.assert_close(layer.mul_scale, torch.ones(64))
+
+    ops = mocker.patch("vllm_omni.quantization.mxfp8_config.get_mxfp8_ops").return_value
+    loaded_scale = torch.linspace(0.5, 2.0, 64)
+    layer.mul_scale.weight_loader(layer.mul_scale, loaded_scale)
+    torch.testing.assert_close(layer.mul_scale, loaded_scale)
+    ops.validate_smooth_scale.assert_called_once_with(loaded_scale)
+
+
+def test_offline_mxfp8_requires_calibration_when_configured(mocker: MockerFixture):
+    _stub_tp_group(mocker)
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    layer = Module()
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True, require_smooth_scale=True))
+    method.create_weights(
+        layer,
+        input_size_per_partition=64,
+        output_partition_sizes=[8],
+        input_size=64,
+        output_size=8,
+        params_dtype=torch.bfloat16,
+        weight_loader=default_weight_loader,
+    )
+    assert not layer.mul_scale.is_checkpoint_optional
+
+
+def test_offline_mxfp8_delegates_smooth_forward_to_mindie_sd(mocker: MockerFixture):
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    ops = mocker.patch("vllm_omni.quantization.mxfp8_config.get_mxfp8_ops").return_value
+    plans = []
+    ops.MXFP8PreparedWeight.side_effect = lambda **kwargs: plans.append(kwargs) or kwargs
+    ops.forward_2d.side_effect = lambda x, prepared, bias, output_dtype: x
+
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True))
+    layer = Module()
+    layer.register_buffer("mul_scale", torch.tensor([2.0, 0.5], dtype=torch.float32))
+    layer.register_buffer("weight", torch.zeros(2, 2))
+    layer.register_buffer("weight_scale", torch.zeros(2, 1, 2))
+    x = torch.tensor([[[3.0, 4.0], [5.0, 8.0]]], dtype=torch.bfloat16)
+    bias = torch.zeros(2)
+
+    output = method.apply(layer, x, bias=bias)
+    replacement = torch.ones(2, 2)
+    layer.weight = replacement
+    method.apply(layer, x.reshape(-1, 2))
+
+    assert output.shape == (1, 2, 2)
+    assert plans[0]["smooth_scale"] is layer.mul_scale
+    assert plans[0]["weight_scale"] is layer.weight_scale
+    assert plans[1]["weight"] is replacement
+    assert plans[1]["smooth_scale"] is layer.mul_scale
+    assert ops.forward_2d.call_args_list[0].kwargs == {"bias": bias, "output_dtype": torch.bfloat16}
+
+
+def test_online_mxfp8_delegates_forward_without_smooth(mocker: MockerFixture):
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8OnlineLinearMethod
+
+    ops = mocker.patch("vllm_omni.quantization.mxfp8_config.get_mxfp8_ops").return_value
+    ops.MXFP8PreparedWeight.side_effect = lambda **kwargs: kwargs
+    ops.forward_2d.return_value = torch.zeros(3, 2, dtype=torch.float16)
+    method = NPUMxfp8OnlineLinearMethod(DiffusionMXFP8Config())
+    layer = Module()
+    layer.register_buffer("weight", torch.zeros(2, 2))
+    layer.register_buffer("weight_scale", torch.zeros(2, 1, 2))
+
+    output = method.apply(layer, torch.zeros(3, 2, dtype=torch.float16))
+
+    assert output.shape == (3, 2)
+    assert ops.MXFP8PreparedWeight.call_args.kwargs["smooth_scale"] is None
+    assert ops.forward_2d.call_args.kwargs["output_dtype"] == torch.float16
+
+
+def test_offline_process_delegates_smooth_and_scale_preparation(mocker: MockerFixture, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8LinearMethod
+
+    ops = mocker.patch("vllm_omni.quantization.mxfp8_config.get_mxfp8_ops").return_value
+    ops.prepare_smooth_scale.side_effect = lambda scale, dtype: scale.to(dtype).contiguous()
+    ops.normalize_weight_scale.side_effect = lambda scale: scale.reshape(scale.shape[0], -1, 2).contiguous()
+    fake_npu = ModuleType("torch_npu")
+    fake_npu.float8_e4m3fn = torch.float8_e4m3fn
+    fake_npu.npu_dtype_cast = mocker.Mock(side_effect=lambda weight, dtype: weight.to(dtype))
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+    monkeypatch.setattr(torch.Tensor, "npu", lambda self: self, raising=False)
+
+    method = NPUMxfp8LinearMethod(DiffusionMXFP8Config(is_checkpoint_mxfp8_serialized=True))
+    layer = Module()
+    layer.orig_dtype = torch.float16
+    layer.input_size_per_partition = 64
+    layer.weight = torch.nn.Parameter(torch.ones(2, 64, dtype=torch.bfloat16), requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(torch.zeros(2, 2, dtype=torch.uint8), requires_grad=False)
+    layer.mul_scale = torch.nn.Parameter(
+        torch.linspace(0.5, 2.0, 64, dtype=torch.float32), requires_grad=False
+    )
+
+    method.process_weights_after_loading(layer)
+
+    ops.prepare_smooth_scale.assert_called_once_with(layer.mul_scale, torch.float16)
+    ops.normalize_weight_scale.assert_called_once()
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert torch.count_nonzero(layer.weight.to(torch.float32) != 1.0) == 0
+    assert layer.weight_scale.shape == (2, 1, 2)
+    assert layer.mul_scale.dtype == torch.float16
+
+
+def test_online_process_keeps_loader_quantization_and_normalizes_scale(mocker: MockerFixture, monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from vllm_omni.quantization.mxfp8_config import DiffusionMXFP8Config, NPUMxfp8OnlineLinearMethod
+
+    ops = mocker.patch("vllm_omni.quantization.mxfp8_config.get_mxfp8_ops").return_value
+    ops.normalize_weight_scale.side_effect = lambda scale: scale.reshape(scale.shape[0], -1, 2).contiguous()
+    fake_npu = ModuleType("torch_npu")
+    fake_npu.float8_e4m3fn = torch.float8_e4m3fn
+    fake_npu.npu_dynamic_mx_quant = mocker.Mock(
+        side_effect=lambda weight, dst_type: (
+            weight.to(dst_type),
+            torch.zeros(weight.shape[0], 2, dtype=torch.uint8),
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch_npu", fake_npu)
+
+    method = NPUMxfp8OnlineLinearMethod(DiffusionMXFP8Config())
+    layer = Module()
+    layer.weight = torch.nn.Parameter(torch.ones(2, 64, dtype=torch.bfloat16), requires_grad=False)
+    original_weight = layer.weight
+
+    method.process_weights_after_loading(layer)
+
+    fake_npu.npu_dynamic_mx_quant.assert_called_once_with(original_weight, dst_type=torch.float8_e4m3fn)
+    ops.normalize_weight_scale.assert_called_once()
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert layer.weight_scale.shape == (2, 1, 2)
 
 
 def test_num_groups_formula():

@@ -41,7 +41,7 @@ Extending to a new MX precision with a different calling convention (e.g. dual-s
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.nn import Module
@@ -72,11 +72,13 @@ from vllm_omni.platforms import current_omni_platform
 from vllm_omni.quantization._copy_missing_attrs import (
     copy_missing_attrs as _copy_missing_attrs,
 )
+from vllm_omni.quantization._mindie_sd import get_mxfp8_ops
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -97,10 +99,16 @@ class DiffusionMXFP8Config(QuantizationConfig):
         self,
         is_checkpoint_mxfp8_serialized: bool = False,
         ignored_layers: list[str] | None = None,
+        require_smooth_scale: bool = False,
     ) -> None:
         super().__init__()
+        if not isinstance(require_smooth_scale, bool):
+            raise ValueError("require_smooth_scale must be a boolean")
+        if require_smooth_scale and not is_checkpoint_mxfp8_serialized:
+            raise ValueError("require_smooth_scale requires an offline MXFP8 checkpoint")
         self.is_checkpoint_mxfp8_serialized = is_checkpoint_mxfp8_serialized
         self.ignored_layers = ignored_layers or []
+        self.require_smooth_scale = require_smooth_scale
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -131,6 +139,7 @@ class DiffusionMXFP8Config(QuantizationConfig):
         return cls(
             is_checkpoint_mxfp8_serialized=is_serialized,
             ignored_layers=ignored_layers,
+            require_smooth_scale=config.get("require_smooth_scale", False),
         )
 
     _XPU_OFFLINE_UNSUPPORTED = (
@@ -349,9 +358,11 @@ class MXFPLinearMethodBase(LinearMethodBase, ABC):
 class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
     """NPU W8A8 MXFP8 offline linear method for pre-quantized checkpoints.
 
-    Weight canonical layout after process_weights_after_loading:
-      weight      : (K, N)              float8_e4m3fn   – pre-transposed for GEMM
-      weight_scale: (K_groups/2, N, 2)  float8_e8m0fnu  – reshaped + pre-transposed
+    Weight storage layout after process_weights_after_loading (kept contiguous
+    for serialization/offload; _quant_matmul creates the transposed views the
+    NPU operator requires):
+      weight      : (N, K)              float8_e4m3fn
+      weight_scale: (N, K_groups/2, 2)  float8_e8m0fnu
 
     NPUMxfp8OnlineLinearMethod normalises to the same layout so apply() is shared.
     """
@@ -397,11 +408,37 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
             "weight_scale",
             ModelWeightParameter(
                 data=torch.empty(output_size_per_partition, num_groups, dtype=torch.uint8),
-                input_dim=None,
+                input_dim=1,
                 output_dim=0,
                 weight_loader=weight_loader,
             ),
         )
+
+        # ``mul_scale`` is the inverse of the usual SmoothQuant scale.  The
+        # runtime computes ``x_smoothed = x * mul_scale`` while the exporter
+        # stores weights as ``w_smoothed = w / mul_scale``.  It follows the K
+        # dimension, so RowParallelLinear shards it with the input channels;
+        # ColumnParallelLinear keeps the full vector on every rank.
+        def smooth_weight_loader(
+            param: ModelWeightParameter, loaded_weight: torch.Tensor, *args: object, **kwargs: object
+        ) -> None:
+            get_mxfp8_ops().validate_smooth_scale(loaded_weight)
+            if not callable(weight_loader):
+                raise ValueError("Loading MXFP8 SmoothQuant requires a callable weight_loader")
+            weight_loader(param, loaded_weight, *args, **kwargs)
+
+        layer.register_parameter(
+            "mul_scale",
+            ModelWeightParameter(
+                data=torch.ones(input_size_per_partition, dtype=torch.float32),
+                input_dim=0,
+                output_dim=None,
+                weight_loader=smooth_weight_loader,
+            ),
+        )
+        setattr(layer.mul_scale, "ignore_warning", True)
+        setattr(layer.mul_scale, "is_checkpoint_optional", not self.quant_config.require_smooth_scale)
+        setattr(layer.weight_scale, "is_checkpoint_required", True)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         """Cast checkpoint weight to FP8 and normalise to canonical GEMM layout."""
@@ -410,34 +447,64 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
 
         import torch_npu
 
-        # Weight: BF16 → float8_e4m3fn via npu_dtype_cast, then transpose (N,K) → (K,N).
+        # Validate and cast the multiplier before moving it to the NPU.  A
+        # finite FP32 value can still become zero/inf in BF16/FP16, which would
+        # make the paired weight and activation transforms invalid. The
+        # validation/application math is owned by MindIE-SD so both runtimes
+        # share one implementation.
+        ops = get_mxfp8_ops()
+        smooth_param = cast(torch.Tensor, layer.mul_scale)
+        smooth = ops.prepare_smooth_scale(smooth_param, cast(torch.dtype, layer.orig_dtype))
+        expected_input = int(layer.input_size_per_partition)
+        if smooth.numel() != expected_input:
+            raise ValueError(
+                f"MXFP8 mul_scale has {smooth.numel()} values, expected {expected_input} for the local input partition"
+            )
+
+        # Keep device transfer and parameter replacement in this loader-owned
+        # path: they are intertwined with vLLM parameter metadata, TP loading
+        # and offload hooks, and wholesale preparation delegation has not been
+        # validated on NPU. MindIE-SD owns the shared validation/layout math.
+        # Keep physical (N, K) checkpoint weights contiguous; MindIE-SD creates
+        # the transposed views required by npu_quant_matmul at call time.
         w = layer.weight
         if w.dtype != torch_npu.float8_e4m3fn:
             w = torch_npu.npu_dtype_cast(w.npu(), torch_npu.float8_e4m3fn)
-        w = w.transpose(0, 1).contiguous()
+        w = w.contiguous()
 
         # Scale: checkpoint stores uint8 bytes that ARE float8_e8m0fnu bits.
-        # Only convert if neither uint8 nor the target NPU dtype already.
-        # Pad K_groups to even so the (K_groups/2, N, 2) reshape is always valid.
-        s = layer.weight_scale.data
-        if s.dtype not in (torch.uint8, torch_npu.float8_e8m0fnu):
-            s = s.to(torch_npu.float8_e8m0fnu)
-        N, K_groups = s.shape
-        if K_groups % 2 == 1:
-            s = torch.cat([s, torch.zeros(N, 1, dtype=s.dtype, device=s.device)], dim=1)
-            K_groups += 1
-        s = s.reshape(N, K_groups // 2, 2).transpose(0, 1).contiguous()
+        # normalize_weight_scale pads odd K_groups to even and reshapes to the
+        # canonical (N, S/2, 2) contiguous layout shared with the online path.
+        s = ops.normalize_weight_scale(layer.weight_scale.data)
 
         replace_parameter(layer, "weight", w)
         replace_parameter(layer, "weight_scale", s)
+        layer.mul_scale.data = smooth.to(device=cast(torch.Tensor, w).device)
         layer._already_called_process_weights_after_loading = True
 
     # --- NPU MXFP8 ops — shared with online path via inheritance ---
 
-    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        import torch_npu
+    def _apply_inner(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        ori_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Run the shared MindIE-SD smooth → quantize → quantized-GEMM path."""
+        ops = get_mxfp8_ops()
+        # Rebuild the lightweight plan from current tensors on every call. This
+        # avoids stale references after online quantization, parameter
+        # replacement, device movement or host offload.
+        prepared = ops.MXFP8PreparedWeight(
+            weight=cast(torch.Tensor, layer.weight),
+            weight_scale=cast(torch.Tensor, layer.weight_scale),
+            smooth_scale=getattr(layer, "mul_scale", None),
+        )
+        return ops.forward_2d(x, prepared, bias=bias, output_dtype=ori_dtype)
 
-        return torch_npu.npu_dynamic_mx_quant(x, dst_type=torch_npu.float8_e4m3fn)
+    def _quantize_activation(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return get_mxfp8_ops().quantize_activation(x)
 
     def _quant_matmul(
         self,
@@ -447,22 +514,15 @@ class NPUMxfp8LinearMethod(MXFPLinearMethodBase):
         bias: torch.Tensor | None,
         ori_dtype: torch.dtype,
     ) -> torch.Tensor:
-        import torch_npu
-
-        # NPU npu_quant_matmul requires bias in float32.
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
-        return torch_npu.npu_quant_matmul(
-            x_q,
-            layer.weight,  # (K, N) float8_e4m3fn
-            layer.weight_scale,  # (S/2, N, 2) float8_e8m0fnu
-            scale_dtype=torch_npu.float8_e8m0fnu,
-            pertoken_scale=x_scale,
-            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-            bias=bias,
-            output_dtype=ori_dtype,
-            group_sizes=[1, 1, 32],
+        # Build the prepared-weight plan from the layer's current parameters on
+        # every call: this keeps the plan from going stale when a weight is
+        # replaced (online quantization) or the layer is moved/offloaded.
+        ops = get_mxfp8_ops()
+        prepared = ops.MXFP8PreparedWeight(
+            weight=cast(torch.Tensor, layer.weight),
+            weight_scale=cast(torch.Tensor, layer.weight_scale),
         )
+        return ops.quant_matmul(x_q, x_scale, prepared, bias=bias, output_dtype=ori_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -499,12 +559,17 @@ class NPUMxfp8OnlineLinearMethod(_LazyWeightMixin, NPUMxfp8LinearMethod):
             layer.register_parameter("weight", weight)
             initialize_single_dummy_weight(layer.weight)
 
-        # NPU: quantize BF16/FP16 (N, K) → FP8 (N, K) + MX scale (N, S).
+        # Keep device materialization/quantization and replace_parameter here:
+        # they are coupled to the lazy vLLM loader and DLO/offload lifecycle,
+        # and delegating the whole preparation step has not been NPU-validated.
+        # MindIE-SD still owns scale normalization and all forward math.
         weight_fp8, weight_scale_raw = torch_npu.npu_dynamic_mx_quant(layer.weight, dst_type=torch_npu.float8_e4m3fn)
 
-        # Normalize to canonical layout shared with offline path.
-        weight_scale = weight_scale_raw.reshape(weight_scale_raw.shape[0], -1, 2).transpose(0, 1).contiguous()
-        weight_fp8 = weight_fp8.transpose(0, 1).contiguous()
+        # Normalize to the offline path's storage contract: contiguous
+        # (N, K) weight and (N, S/2, 2) scale; _quant_matmul builds the
+        # transposed views the NPU operator requires.
+        weight_scale = get_mxfp8_ops().normalize_weight_scale(weight_scale_raw)
+        weight_fp8 = weight_fp8.contiguous()
 
         replace_parameter(layer, "weight", weight_fp8)
         replace_parameter(layer, "weight_scale", weight_scale)

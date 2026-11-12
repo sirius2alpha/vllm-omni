@@ -517,10 +517,15 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             logger.info(
                 "[H3_VAE_FP16_WEIGHTS] %d decoder-block linears persisted as fp16 device=%s", len(_linears), device
             )
-        if offline_checkpoint is not None and offline_checkpoint.execution_mode == "native_mx":
-            from .native_mx import install_native_mx_vae
+        if offline_checkpoint is not None and offline_checkpoint.execution_mode in {"native_mx", "native_int"}:
+            if offline_checkpoint.execution_mode == "native_int":
+                from .native_int import install_native_int_vae
 
-            install_native_mx_vae(self.remote.model, offline_checkpoint, device)
+                install_native_int_vae(self.remote.model, offline_checkpoint, device)
+            else:
+                from .native_mx import install_native_mx_vae
+
+                install_native_mx_vae(self.remote.model, offline_checkpoint, device)
         self.model = self.remote.model
         self._stager = None
         self._encoder_stager = None
@@ -1496,10 +1501,15 @@ class MiniMaxH3AudioVAE(nn.Module):
         # encoding and waveform decoding.
         initial_device = load_device or device
         self.remote.eval().to(device=initial_device, dtype=torch.float32)
-        if offline_checkpoint is not None and offline_checkpoint.execution_mode == "native_mx":
-            from .native_mx import install_native_mx_vae
+        if offline_checkpoint is not None and offline_checkpoint.execution_mode in {"native_mx", "native_int"}:
+            if offline_checkpoint.execution_mode == "native_int":
+                from .native_int import install_native_int_vae
 
-            install_native_mx_vae(self.remote.model, offline_checkpoint, device)
+                install_native_int_vae(self.remote.model, offline_checkpoint, device)
+            else:
+                from .native_mx import install_native_mx_vae
+
+                install_native_mx_vae(self.remote.model, offline_checkpoint, device)
         self._stager = None
         if initial_device.type == "cpu" and device.type not in ("cpu", "meta"):
             self._stager = PinnedModuleStager(

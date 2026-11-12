@@ -35,9 +35,9 @@ _EXECUTED_BITS: set[int] = set()
 
 
 def _target_bits(scheme: str) -> int | None:
-    if scheme in {_MX4_SINGLE, _MX4_DUAL}:
+    if scheme in {_MX4_SINGLE, _MX4_DUAL, "W4A4_DYNAMIC"}:
         return 4
-    return 8 if scheme == _MX8 else None
+    return 8 if scheme in {_MX8, "W8A8_DYNAMIC"} else None
 
 
 @torch.no_grad()

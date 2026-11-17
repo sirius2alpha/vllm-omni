@@ -18,6 +18,9 @@ from pathlib import Path
 
 import torch
 from safetensors import safe_open
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 _MX8 = "W8A8_MXFP8"
 _MX4 = "W4A4_MXFP4_DUALSCALE"
@@ -111,6 +114,7 @@ class OfflineComponentCheckpoint:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).resolve()
         self.execution_mode = "dequantize"
+        self.single_scale_mx4 = False
         if not self.path.is_dir():
             raise ValueError(f"offline component directory does not exist: {self.path}")
         description_path = self.path / "quant_model_description.json"
@@ -186,11 +190,10 @@ class OfflineComponentCheckpoint:
                 raise ValueError(f"{name}: invalid weight_scale dtype {scale.dtype}")
             if self.description.get(module + ".weight_scale") != scheme:
                 raise ValueError(f"{name}: weight_scale scheme mismatch")
-            if scheme == _MX4:
-                dual = self.tensors.get(module + ".weight_dual_scale")
+            if scheme == _MX4 and module + ".weight_dual_scale" in self.tensors:
+                dual = self.tensors[module + ".weight_dual_scale"]
                 if (
-                    dual is None
-                    or dual.dtype != "F32"
+                    dual.dtype != "F32"
                     or len(dual.shape) != 3
                     or dual.shape[0] != n
                     or dual.shape[-1] != 1
@@ -198,7 +201,15 @@ class OfflineComponentCheckpoint:
                     or groups % dual.shape[1]
                     or self.description.get(module + ".weight_dual_scale") != scheme
                 ):
-                    raise ValueError(f"{name}: missing or invalid weight_dual_scale")
+                    raise ValueError(f"{name}: invalid weight_dual_scale")
+            elif scheme == _MX4:
+                # Some deliveries (e.g. the Ref2VA FP4 export) are converted without the
+                # FP32 coarse dual scale and keep only the E8M0 group scale. Reconstruct
+                # those as single-scale MXFP4 instead of rejecting the checkpoint; the
+                # native MX runtime re-encodes to single-scale groups of 32 regardless.
+                if module + ".weight_dual_scale" in self.description:
+                    raise ValueError(f"{name}: weight_dual_scale is declared but missing from the shards")
+                self.single_scale_mx4 = True
         for name, spec in self.tensors.items():
             module, _, kind = name.rpartition(".")
             scheme = self.description.get(module + ".weight")
@@ -221,6 +232,12 @@ class OfflineComponentCheckpoint:
         )
         if not self.schemes:
             raise ValueError(f"offline checkpoint contains no quantized weights: {self.path}")
+        if self.single_scale_mx4:
+            logger.warning(
+                "%s: FP4 weights carry only the E8M0 group scale (no weight_dual_scale); "
+                "reconstructing single-scale MXFP4",
+                self.path,
+            )
 
     def integer_weight(self, name: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Read exact signed codes and scales, independent of runtime packing."""
@@ -292,7 +309,11 @@ class OfflineComponentCheckpoint:
                             raise ValueError(f"{name}: integer scale must be finite and positive")
                         weight = weight.float() * scale.reshape(-1, 1)
                     else:
-                        dual = read(prefix + "weight_dual_scale") if scheme == _MX4 else None
+                        dual = (
+                            read(prefix + "weight_dual_scale")
+                            if scheme == _MX4 and prefix + "weight_dual_scale" in self.tensors
+                            else None
+                        )
                         weight = reconstruct_mx_weight(weight, scale, dual)
                 elif not dequantize and scheme not in {"FLOAT", _INT8, _INT4}:
                     raise ValueError(

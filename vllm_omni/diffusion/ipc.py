@@ -239,7 +239,13 @@ def _tensor_to_shm(
         torch.accelerator.set_stream(d2h_stream)
         try:
             t = tensor.detach()
-            cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            try:
+                cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+            except torch.OutOfMemoryError as exc:
+                logger.warning_once(
+                    "Pinned D2H allocation failed; using pageable host memory for this transfer: %s", exc
+                )
+                cpu = torch.empty(t.shape, dtype=t.dtype, pin_memory=False)
             cpu.copy_(t, non_blocking=True)
         finally:
             torch.accelerator.set_stream(old_stream)

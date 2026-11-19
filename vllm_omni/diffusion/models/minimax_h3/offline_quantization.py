@@ -10,6 +10,7 @@ The reader itself performs no activation quantization or GEMM.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -29,6 +30,31 @@ _INT4 = "W4A4_DYNAMIC"
 _INT_SCHEMES = {_INT4, _INT8}
 _MX_SCHEMES = {_MX4, _MX8}
 _FLOAT_DTYPES = {"F16", "BF16", "F32", "F64"}
+
+def _native_int_enabled_schemes() -> frozenset[str]:
+    raw = os.environ.get("H3_NATIVE_INT_SCHEMES", "W4A4_DYNAMIC,W8A8_DYNAMIC")
+    enabled = frozenset(value.strip() for value in raw.split(",") if value.strip())
+    if not enabled or not enabled <= _INT_SCHEMES:
+        raise ValueError(f"H3_NATIVE_INT_SCHEMES must select a nonempty subset of {_INT_SCHEMES}: {enabled}")
+    return enabled
+
+def _native_int_target_enabled(name: str, scheme: str) -> bool:
+    if scheme not in _native_int_enabled_schemes():
+        return False
+    limit = int(os.environ.get("H3_NATIVE_INT_BLOCK_LIMIT", "0"))
+    if limit < 0:
+        raise ValueError("H3_NATIVE_INT_BLOCK_LIMIT must be nonnegative")
+    if name.startswith("blocks."):
+        block = int(name.split(".", 2)[1])
+        if limit and block >= limit:
+            return False
+        raw_types = os.environ.get("H3_NATIVE_INT_LAYER_TYPES", "")
+        types = {value.strip() for value in raw_types.split(",") if value.strip()}
+        if not types <= {"adaln_proj", "attn", "mlp"}:
+            raise ValueError(f"invalid H3_NATIVE_INT_LAYER_TYPES: {types}")
+        if types and not any(f".{layer_type}." in name for layer_type in types):
+            return False
+    return True
 
 
 def npu_quant_family(device_name: str) -> str:
@@ -283,8 +309,9 @@ class OfflineComponentCheckpoint:
                 kind = name.rpartition(".")[2]
                 if kind == "bias":
                     scheme = "FLOAT"
+                tensor_dequantize = dequantize or (scheme in _INT_SCHEMES and not _native_int_target_enabled(name, scheme))
                 if scheme != "FLOAT" and kind != "weight":
-                    if not dequantize and kind == "weight_scale":
+                    if not tensor_dequantize and kind == "weight_scale":
                         scale = read(name)
                         if not torch.isfinite(scale).all() or torch.any(scale <= 0):
                             raise ValueError(f"{name}: integer scale must be finite and positive")
@@ -301,7 +328,7 @@ class OfflineComponentCheckpoint:
                     weight = unpack_int4(weight) if weight.dtype == torch.int32 else weight
                     if torch.any(weight < -8) or torch.any(weight > 7):
                         raise ValueError(f"{name}: INT4 signed codes must be in [-8,7]")
-                if dequantize and scheme != "FLOAT":
+                if tensor_dequantize and scheme != "FLOAT":
                     prefix = name.removesuffix("weight")
                     scale = read(prefix + "weight_scale")
                     if scheme in _INT_SCHEMES:
@@ -315,7 +342,7 @@ class OfflineComponentCheckpoint:
                             else None
                         )
                         weight = reconstruct_mx_weight(weight, scale, dual)
-                elif not dequantize and scheme not in {"FLOAT", _INT8, _INT4}:
+                elif not tensor_dequantize and scheme not in {"FLOAT", _INT8, _INT4}:
                     raise ValueError(
                         "native MX loading is unavailable for this delivery; select execution_mode='dequantize'"
                     )

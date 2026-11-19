@@ -208,6 +208,21 @@ class NativeIntLinearMethod(BaseInt8LinearMethod):
 class H3NativeIntConfig(H3NativeMXConfig):
     delivery_schemes = {_INT4, _INT8}
 
+    @classmethod
+    def from_checkpoint(cls, checkpoint):
+        config = super().from_checkpoint(checkpoint)
+        from .offline_quantization import _native_int_enabled_schemes, _native_int_target_enabled
+
+        enabled = _native_int_enabled_schemes()
+        config.targets = {
+            name: bits
+            for name, bits in config.targets.items()
+            if (_INT4 if bits == 4 else _INT8) in enabled
+            and _native_int_target_enabled(name + ".weight", _INT4 if bits == 4 else _INT8)
+        }
+        logger.info("H3 native INT scheme filter enabled=%s target_modules=%d", sorted(enabled), len(config.targets))
+        return config
+
     def get_name(self):
         return "h3_native_int"
 

@@ -404,3 +404,53 @@ def test_serialized_int8_qkv_and_mlp_scales_follow_real_tp_loaders(monkeypatch, 
             torch.testing.assert_close(
                 layer.weight_scale[: original_weight.shape[0]], original_scale.flatten(), rtol=0, atol=0
             )
+
+
+def test_tile8_int4_partitions_disjoint_tiles_and_zero_rows():
+    from vllm_omni.diffusion.models.minimax_h3.native_int import _int4_activation_bands
+
+    # Exact quarter boundaries and negative peaks stay in the higher band.
+    peaks = torch.tensor([64.0, -16.0, 4.0, -1.0, 0.25, 0.0], dtype=torch.bfloat16)
+    row = peaks.repeat_interleave(8)
+    x = torch.stack((row, row * 0.5, torch.zeros_like(row)))
+    bands = _int4_activation_bands(x)
+    assert bands.shape == (4, 3, row.numel())
+    torch.testing.assert_close(bands.sum(0), x, rtol=0, atol=0)
+    assert (bands.count_nonzero(0) <= 1).all()
+    assert torch.equal(bands[:, 0, ::8].abs().argmax(dim=0)[:5], torch.tensor([0, 0, 1, 2, 3]))
+
+
+def test_banded_int4_linear_matches_grouped_reference_across_chunks(monkeypatch):
+    import torch_npu
+
+    from vllm_omni.diffusion.models.minimax_h3 import native_int
+    from vllm_omni.diffusion.models.minimax_h3.integer_utils import pack_int4, unpack_int4
+
+    generator = torch.Generator().manual_seed(118)
+    rows = torch.randn(513, 64, generator=generator).bfloat16()
+    rows[:, :8] *= 128
+    rows[0].zero_()
+    codes = torch.randint(-8, 8, (97, 64), dtype=torch.int8, generator=generator)
+    packed = pack_int4(codes)[1:]
+    scale = torch.rand(97, generator=generator)[1:] + 0.01
+    qs = torch.ones(97)[1:]
+
+    def quant(x, dst_type):
+        assert dst_type == torch.quint4x2
+        sx = x.float().abs().amax(1) / 7
+        q = (x.float() / sx.clamp_min(1e-20)[:, None]).round().clamp(-8, 7).to(torch.int8)
+        return pack_int4(q), sx
+
+    def gemm(x, w, epilogue_scale, output_dtype):
+        assert w.storage_offset() == epilogue_scale.storage_offset() == 0
+        return ((unpack_int4(x).float() @ unpack_int4(w.T).float().T) * epilogue_scale).to(output_dtype)
+
+    monkeypatch.setattr(native_int, "_OUTPUT_CHUNK", 32)
+    monkeypatch.setattr(torch_npu, "npu_dynamic_quant", quant)
+    monkeypatch.setattr(torch_npu, "npu_quant_matmul", gemm)
+    y = native_int._banded_int4_linear(rows, packed, scale, qs, 73, torch.bfloat16)
+    ref = torch.zeros(513, 73)
+    for band in native_int._int4_activation_bands(rows):
+        q, sx = quant(band, torch.quint4x2)
+        ref += (unpack_int4(q).float() @ codes[1:74].float().T).half().float() * sx[:, None]
+    torch.testing.assert_close(y, (ref * scale[:73]).bfloat16())

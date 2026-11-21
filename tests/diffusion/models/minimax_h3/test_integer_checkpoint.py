@@ -153,3 +153,17 @@ def test_native_auto_selects_and_validates_without_format_fallback(tmp_path, mon
     wrong = mx_cp if family == "int" else int_cp
     with pytest.raises(ValueError, match="requires"):
         reader.resolve_offline_components({"path": str(wrong.path)})
+
+
+@pytest.mark.parametrize("mode", ["per_token", "tile8_4band"])
+def test_int4_activation_scaling_selects_transformer_only(tmp_path, monkeypatch, mode):
+    cp = checkpoint(tmp_path / "int4", torch.zeros(8, 32, dtype=torch.int8), torch.ones(8, 1))
+    monkeypatch.setattr(reader, "resolve_npu_quant_family", lambda: "int")
+    spec = {"components": {"transformer": str(cp.path), "audio_vae": str(cp.path)}, "int4_activation_scaling": mode}
+    components, dequant = reader.resolve_offline_components(spec)
+    assert not dequant
+    assert components["transformer"].int4_activation_scaling == mode
+    assert components["audio_vae"].int4_activation_scaling == "per_token"
+    if mode == "tile8_4band":
+        with pytest.raises(ValueError, match="native INT4 transformer"):
+            reader.resolve_offline_components(dict(spec, execution_mode="dequantize"))

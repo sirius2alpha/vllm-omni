@@ -32,7 +32,43 @@ def _verify_pack_abi(device: str) -> None:
         raise RuntimeError("NPU INT4 packing ABI differs from H3 checkpoint layout")
 
 
-def native_int_linear(x, weight, scale, bits, bias, logical_n, logical_k, qmm_scale=None):
+def _int4_activation_bands(rows: torch.Tensor) -> torch.Tensor:
+    """Assign each eight-channel tile to one of four per-token scales."""
+    tiles = rows.reshape(rows.shape[0], -1, 8)
+    peak = tiles.abs().amax(dim=-1, keepdim=True)
+    row_peak = peak.amax(dim=1, keepdim=True)
+    band = (peak < row_peak * 0.25).int()
+    band = band + (peak < row_peak * 0.0625).int() + (peak < row_peak * 0.015625).int()
+    return torch.stack([torch.where(band == i, tiles, 0).reshape_as(rows) for i in range(4)])
+
+
+def _banded_int4_linear(rows, weight, scale, qmm_scale, logical_n, dtype):
+    import torch_npu
+
+    output = rows.new_empty((rows.shape[0], logical_n), dtype=dtype)
+    # Bound the stacked rows and FP32 partials even for long video references.
+    for row_offset in range(0, rows.shape[0], 512):
+        batch = rows[row_offset : row_offset + 512]
+        band_rows = _int4_activation_bands(batch).flatten(0, 1)
+        codes, token_scale = torch_npu.npu_dynamic_quant(band_rows, dst_type=torch.quint4x2)
+        token_scale = torch.where(torch.isfinite(token_scale), token_scale, 0).reshape(4, len(batch), 1)
+        for col in range(0, logical_n, _OUTPUT_CHUNK):
+            end = min(col + _OUTPUT_CHUNK, weight.shape[0])
+            packed = weight[col:end]
+            if packed.storage_offset() or not packed.is_contiguous():
+                packed = packed.clone(memory_format=torch.contiguous_format)
+            epilogue_scale = qmm_scale[col:end]
+            if epilogue_scale.storage_offset() or not epilogue_scale.is_contiguous():
+                epilogue_scale = epilogue_scale.clone(memory_format=torch.contiguous_format)
+            partial = torch_npu.npu_quant_matmul(codes, packed.T, epilogue_scale, output_dtype=torch.float16)
+            partial = partial.float().reshape(4, len(batch), end - col)
+            values = (partial * token_scale).sum(0) * (scale[col:end] / epilogue_scale)
+            width = min(end, logical_n) - col
+            output[row_offset : row_offset + len(batch), col : col + width] = values[:, :width].to(dtype)
+    return output
+
+
+def native_int_linear(x, weight, scale, bits, bias, logical_n, logical_k, qmm_scale=None, *, banded_int4=False):
     """Native integer GEMM with floating public boundaries and current DLO views."""
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise ValueError("native INT activations must be FP16, BF16, or FP32")
@@ -67,6 +103,14 @@ def native_int_linear(x, weight, scale, bits, bias, logical_n, logical_k, qmm_sc
     if x.numel() == 0:
         return x.new_empty((*shape[:-1], logical_n))
     bridge = nn.functional.pad(x.reshape(-1, logical_k).to(torch.bfloat16), (0, pk - logical_k))
+    if bits == 4 and banded_int4:
+        output = _banded_int4_linear(bridge, weight, scale, qmm_scale, logical_n, dtype)
+        if bias is not None:
+            output = output + bias.to(dtype)
+        if bits not in _EXECUTED_BITS:
+            logger.info("H3 native INT executed W4A4: tile8_4band npu_dynamic_quant + npu_quant_matmul")
+            _EXECUTED_BITS.add(bits)
+        return output.reshape(*shape[:-1], logical_n)
     qx, sx = torch_npu.npu_dynamic_quant(bridge, dst_type=torch.quint4x2 if bits == 4 else torch.int8)
     if qx.dtype != weight.dtype or sx.dtype != torch.float32:
         raise RuntimeError("NPU dynamic integer quantization violated the storage contract")
@@ -168,11 +212,12 @@ def install_native_int_vae(model, checkpoint, device):
 
 
 class NativeIntLinearMethod(BaseInt8LinearMethod):
-    def __init__(self, bits):
+    def __init__(self, bits, *, banded_int4=False):
         super().__init__(DiffusionInt8Config(is_checkpoint_int8_serialized=True))
         if bits not in (4, 8):
             raise ValueError("native integer method requires bits=4/8")
         self.bits = bits
+        self.banded_int4 = banded_int4
 
     def create_weights(self, layer, *args, **kwargs):
         super().create_weights(layer, *args, **kwargs)
@@ -202,17 +247,20 @@ class NativeIntLinearMethod(BaseInt8LinearMethod):
             layer.output_size_per_partition,
             layer.input_size_per_partition,
             layer.qmm_scale,
+            banded_int4=self.banded_int4,
         )
 
 
 class H3NativeIntConfig(H3NativeMXConfig):
     delivery_schemes = {_INT4, _INT8}
+    banded_int4 = False
 
     @classmethod
     def from_checkpoint(cls, checkpoint):
         config = super().from_checkpoint(checkpoint)
         from .offline_quantization import _native_int_enabled_schemes, _native_int_target_enabled
 
+        config.banded_int4 = checkpoint.int4_activation_scaling == "tile8_4band"
         enabled = _native_int_enabled_schemes()
         config.targets = {
             name: bits
@@ -230,7 +278,9 @@ class H3NativeIntConfig(H3NativeMXConfig):
         if not isinstance(layer, LinearBase):
             return None
         bits = self.targets.get(prefix.removeprefix("transformer."))
-        return NativeIntLinearMethod(bits) if bits else UnquantizedLinearMethod()
+        if bits:
+            return NativeIntLinearMethod(bits, banded_int4=self.banded_int4 and bits == 4)
+        return UnquantizedLinearMethod()
 
     def validate_model_targets(self, model):
         installed = {

@@ -135,6 +135,34 @@ the task partition at startup with **`--task-type`** (`fl2va` or `ref2va`).
 When unset, only the T2VA/FL2VA weights are loaded. All remaining flags are
 task-agnostic.
 
+### Standalone Ref2VA with an offline INT4/INT8 DiT (A3)
+
+Keep `MODEL` pointed at the native model root containing `Ref2VA/model_index.json`.
+For a ModelSlim delivery whose `transformer_ref` directory contains
+`quant_model_description.json` and indexed safetensors, add these arguments to
+the A3 launch command below (replace the existing `--task-type` argument):
+
+```bash
+--task-type ref2va \
+--additional-config '{"offline_quantization":{"execution_mode":"native_int","int4_activation_scaling":"tile8_4band","components":{"transformer":"/path/to/delivery/transformer_ref"}}}'
+```
+
+For DiT INT4 activations with large outliers, `tile8_4band` assigns each
+consecutive tile of eight input channels to one of four scales per token.
+The tile peak determines its band at 1/4, 1/16 and 1/64 of the row peak.
+The runtime performs four masked INT4 matrix products with the delivered
+INT4 weights and sums the scaled results in FP32. This costs additional
+compute. Omitting the option uses the checkpoint's standard `per_token` scaling.
+
+`transformer` is the component name in a standalone Ref2VA pipeline;
+`transformer_ref` is the directory name in this delivery. The text encoder and
+both VAEs still come from the Ref2VA partition of `MODEL`. Do not pass a second
+`--quantization` setting. Send `extra_params.task=ref2va` and repeat the
+multipart `input_references` field once per reference, with its actual MIME
+type (`image/jpeg`, `video/mp4`, or `audio/wav`, for example). Check the
+worker log for both `H3 native INT executed W4A4` and `W8A8` when testing a
+mixed delivery; a decodable output alone does not establish visual quality.
+
 ### Recommended lossless configuration (Atlas 800I A2 / A3)
 
 Lossless means fused operators plus the high-performance FLASH_ATTN backend

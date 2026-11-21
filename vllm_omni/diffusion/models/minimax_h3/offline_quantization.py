@@ -140,6 +140,7 @@ class OfflineComponentCheckpoint:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path).resolve()
         self.execution_mode = "dequantize"
+        self.int4_activation_scaling = "per_token"
         self.single_scale_mx4 = False
         if not self.path.is_dir():
             raise ValueError(f"offline component directory does not exist: {self.path}")
@@ -357,9 +358,12 @@ def resolve_offline_components(
         return {}, False
     if not isinstance(config, Mapping):
         raise ValueError("offline_quantization must be a mapping")
-    unknown = set(config) - {"path", "components", "execution_mode", "format_paths"}
+    unknown = set(config) - {"path", "components", "execution_mode", "format_paths", "int4_activation_scaling"}
     if unknown:
         raise ValueError(f"unknown offline_quantization options: {sorted(unknown)}")
+    activation_scaling = config.get("int4_activation_scaling", "per_token")
+    if activation_scaling not in ("per_token", "tile8_4band"):
+        raise ValueError("int4_activation_scaling must be per_token or tile8_4band")
     mode = config.get("execution_mode", "native_auto")
     if mode not in {"native", "native_auto", "dequantize", "native_mx", "native_int"}:
         raise ValueError("offline execution_mode must be native_auto, native_mx, native_int, or dequantize")
@@ -400,6 +404,11 @@ def resolve_offline_components(
     if unknown_components := set(paths) - {"transformer", "video_vae", "audio_vae"}:
         raise ValueError(f"unsupported offline components: {sorted(unknown_components)}")
     checkpoints = {name: OfflineComponentCheckpoint(path) for name, path in paths.items()}
+    if activation_scaling == "tile8_4band":
+        dit = checkpoints.get("transformer")
+        if mode != "native_int" or dit is None or _INT4 not in dit.schemes:
+            raise ValueError("tile8_4band requires a native INT4 transformer checkpoint")
+        dit.int4_activation_scaling = activation_scaling
     for checkpoint in checkpoints.values():
         checkpoint.execution_mode = str(mode)
     expected = _MX_SCHEMES if mode == "native_mx" else _INT_SCHEMES

@@ -174,8 +174,25 @@ class NativeIntLinearMethod(BaseInt8LinearMethod):
             raise ValueError("native integer method requires bits=4/8")
         self.bits = bits
 
-    def create_weights(self, layer, *args, **kwargs):
-        super().create_weights(layer, *args, **kwargs)
+    def create_weights(
+        self,
+        layer: nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs: object,
+    ) -> None:
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
         # Preserve channel scales even when a parent is cast before or after
         # loading. This also covers direct VAE wrappers through the same helper.
         layer._h3_integer_original_apply = layer._apply

@@ -38,17 +38,17 @@ def prepare_integer_weight(weight: torch.Tensor, scale: torch.Tensor, bits: int)
     weight, scale = weight.cpu(), scale.detach().cpu().reshape(-1)
     if not torch.isfinite(scale).all() or torch.any(scale <= 0):
         raise ValueError("integer weight scale must be finite and positive")
-    pn, pk = (n + 31) // 32 * 32, (k + 31) // 32 * 32
-    padded = nn.functional.pad(weight, (0, pk - k, 0, pn - n))
-    scales = nn.functional.pad(scale, (0, pn - n), value=1)
+    padded_n, pk = (n + 31) // 32 * 32, (k + 31) // 32 * 32
+    padded = nn.functional.pad(weight, (0, pk - k, 0, padded_n - n))
+    scales = nn.functional.pad(scale, (0, padded_n - n), value=1)
     if bits == 8:
         return padded, scales, None
     # Bound workspace for wide H3 AdaLN matrices; never materialize their
     # entire eight-times-larger int64 unpack/pack intermediate.
-    packed = torch.empty((pn, pk // 8), dtype=torch.int32, device="cpu")
-    bound = torch.empty(pn, dtype=torch.float32, device="cpu")
+    packed = torch.empty((padded_n, pk // 8), dtype=torch.int32, device="cpu")
+    bound = torch.empty(padded_n, dtype=torch.float32, device="cpu")
     rows = max(1, 8 * 1024 * 1024 // (pk * 16))
-    for start in range(0, pn, rows):
+    for start in range(0, padded_n, rows):
         chunk = padded[start : start + rows]
         packed[start : start + rows] = pack_int4(chunk)
         bound[start : start + rows] = (chunk.to(torch.int32).abs().sum(1) * 8).clamp_min(1).float()

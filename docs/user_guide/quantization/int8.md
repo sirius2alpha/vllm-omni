@@ -115,3 +115,40 @@ omni = Omni(
 
 Only add a new model to the supported table after comparing the Int8 output
 against a BF16 baseline and documenting any required `ignored_layers`.
+
+## MiniMax H3 offline INT4/INT8 checkpoints
+
+On Ascend A2/A3 (`Ascend910B*`, `Ascend910C*`, `Ascend910_93*`), MiniMax H3 can
+override component weight sources with ModelSlim dynamic integer checkpoints
+(`W8A8_DYNAMIC` / `W4A4_DYNAMIC`) while keeping `model` pointed at the original
+H3 partition for architecture config, tokenizer, text encoder, and trusted VAE
+modeling code.
+
+```python
+omni = Omni(
+    model="/path/to/original/FL2VA",
+    trust_remote_code=True,
+    quantization_config=None,
+    additional_config={
+        "offline_quantization": {
+            "components": {"transformer": "/path/to/int/transformer"},
+            "execution_mode": "native_int",
+        },
+    },
+)
+```
+
+- Supported schemes are `W8A8_DYNAMIC` (signed `int8` `[N, K]`) and
+  `W4A4_DYNAMIC` (signed `int8` `[N, K]` or packed `int32`) with positive,
+  finite FP32 per-output-channel `weight_scale` (`[N]` or `[N, 1]`). Optional
+  `weight_offset` must be zero; static correction tensors (`quant_bias`,
+  `input_scale`, `input_offset`, `deq_scale`) are rejected.
+- Keep `quantization_config=None`. `execution_mode` defaults to `native_auto`,
+  which resolves to `native_int` on A2/A3 and `native_mx` on A5; `format_paths`
+  can map `"int"` and `"mx"` to device-specific checkpoint paths.
+- Serialized integer codes and FP32 channel scales are preserved without
+  startup requantization; activations are quantized dynamically via
+  `npu_dynamic_quant` and multiplied via `npu_quant_matmul`. FLOAT projections
+  stay unquantized, and fused QKV/MLP constituents must share a scheme.
+- For Ascend A5 MXFP4/MXFP8 checkpoints, see the
+  [MXFP8 guide](./mxfp8.md#minimax-h3-offline-mx-checkpoints).

@@ -149,9 +149,15 @@ multi-transformer pipeline.
 
 MiniMax H3's `additional_config.offline_quantization` overrides component weight
 sources while preserving the original model snapshot's architecture and
-non-overridden components. Its streaming reader validates the ModelSlim MX
-scheme (`W8A8_MXFP8`, `W4A4_MXFP4`, or `W4A4_MXFP4_DUALSCALE`), tensor dtype,
-shape, shard index, and required scales before loading.
+non-overridden components. Its streaming reader validates the ModelSlim scheme
+(`W8A8_MXFP8`, `W4A4_MXFP4`, `W4A4_MXFP4_DUALSCALE`, `W8A8_DYNAMIC`, or
+`W4A4_DYNAMIC`), tensor dtype, shape, shard index, and required scales before
+loading. On Ascend A2/A3 (`Ascend910B*`, `Ascend910C*`, `Ascend910_93*`),
+`execution_mode="native_int"` (or `native_auto`) executes serialized dynamic
+INT4/INT8 weights through `H3NativeIntConfig` and `NativeIntLinearMethod`,
+retaining QKV/MLP TP loaders, exact serialized integer codes, FP32 per-channel
+scales, and bounded INT4 FP16 epilogue scaling while keeping FLOAT projections
+unquantized.
 
 H3 accepts mixed MXFP8 and single-scale or dual-scale MXFP4 deliveries through
 an explicit `execution_mode="dequantize"` compatibility path, which reconstructs
@@ -175,7 +181,8 @@ Custom component readers bypass direct checkpoint mmap; HSDP and host weight
 runtime are rejected for these overrides. VAE state replacement happens before
 inference patches are installed. See the
 [MXFP8 guide](../../user_guide/quantization/mxfp8.md#minimax-h3-offline-mx-checkpoints)
-for the supported checkpoint contract and limitations.
+and [INT8 guide](../../user_guide/quantization/int8.md#minimax-h3-offline-int4int8-checkpoints)
+for the supported checkpoint contracts and limitations.
 
 ## Model and layer integration
 
